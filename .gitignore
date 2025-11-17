@@ -35,7 +35,6 @@ env/
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
-*.ipynb
 
 # Data files (too large for git)
 data/railsem19/
