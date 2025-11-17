@@ -1,0 +1,1 @@
+# Standalone prediction on new images (single image, batch folder, etc.)
