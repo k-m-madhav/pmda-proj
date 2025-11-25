@@ -1,11 +1,10 @@
-# All settings and mappings:
-# new category mapping dict, relevant hyperparameters, input/output directories
+# src/config.py
 
 """
 Project configuration: category mappings, directories, training parameters, etc.
 """
 
-# src/config.py
+import numpy as np
 import torch
 
 # =========== MODEL SETTINGS ===========
@@ -14,7 +13,6 @@ PRETRAINED_MODEL_NAME = "facebook/dinov2-base" # dinov3-vit7b16-pretrain-lvd1689
 # =========== CATEGORY MAPPINGS ===========
 
 # Original class indices (as per order in rs19-config.json)
-# You should generate this from your dataframe for your actual dataset
 ORIGINAL_CLASS_NAMES = [
     "road", "sidewalk", "construction", "tram-track", "fence", "pole",
     "traffic-light", "traffic-sign", "vegetation", "terrain", "sky", "human",
@@ -22,10 +20,11 @@ ORIGINAL_CLASS_NAMES = [
 ]
 
 # Final three categories (index: class name)
-COMBINED_LABELS = {
+FINAL_CLASS_NAMES = {
     0: "Track area",
     1: "Scene context",
-    2: "Object"
+    2: "Object",
+    255: "Void"
 }
 
 VOID_LABEL = 255  # Mask "ignore" value
@@ -54,11 +53,18 @@ ORIG_TO_COMBINED = {
     # Others (e.g. 255) can map to VOID_LABEL or be ignored
 }
 
-COMBINED_COLORS = {
+# RGB format (0-255) for Streamlit HTML/CSS
+CLASS_COLORS_RGB = {
     0: [255, 0, 0], # Track area - Red
     1: [0, 255, 0], # Scene context - Green
     2: [0, 0, 255], # Object - Blue
     255: [0, 0, 0], # Void - Black
+}
+
+# Normalized format (0-1) for matplotlib/visualization
+CLASS_COLORS_NORMALIZED = {
+    k: np.array(v) / 255.0
+    for k, v in CLASS_COLORS_RGB.items()
 }
 
 # =========== DEFAULT DIRECTORIES ===========
@@ -72,19 +78,19 @@ PROCESSED_MASK_DIR = f"{DATA_DIR}/processed_masks"  # For remapped masks
 # =========== TRAINING SETTINGS ===========
 
 # Dataset
-SUBSET_SIZE = 100  # Start small for CPU training
+SUBSET_SIZE = 100      # Start small for CPU training
 VAL_RATIO = 0.2
 
 # Training
-NUM_EPOCHS = 10  # Reasonable for initial training
-BATCH_SIZE = 4   # Smaller for CPU
+NUM_EPOCHS = 10        # Reasonable for initial training
+BATCH_SIZE = 4         # Smaller for CPU
 LEARNING_RATE = 1e-3
 
-# Class imbalance (from 1000-sample analysis)
+# Class imbalance (from 1000-sample analysis). Object class is getting a higher weight
 CLASS_WEIGHTS = [1.0, 1.0, 2.72]
 
 # Monitoring
-LOG_INTERVAL = 5      # Log every 10 batches
+LOG_INTERVAL = 5       # Log every 10 batches
 SAVE_INTERVAL = 5      # Save checkpoint every 5 epochs
 EARLY_STOPPING = True
 PATIENCE = 10          # Stop if no improvement for 10 epochs
@@ -92,17 +98,20 @@ PATIENCE = 10          # Stop if no improvement for 10 epochs
 # Paths
 CHECKPOINT_DIR = "checkpoints"
 LOG_DIR = "logs"
+BEST_MODEL_PATH = "checkpoints/best_model.pth"
 
 # =========== HYPERPARAMETERS ===========
 
 RANDOM_SEED = 42
 NUM_WORKERS = 2
 LEARNING_RATE = 1e-3
-NUM_COMBINED_CLASSES = len(COMBINED_LABELS)
+NUM_COMBINED_CLASSES = len(FINAL_CLASS_NAMES) - 1
 INPUT_SIZE = 518
 PATCH_GRID_SIZE = 37
 FEATURE_DIM = 768
 
 # =========== OTHER SETTINGS ===========
 
+CONFIDENCE_THRESHOLD_DEFAULT = 0.5
+OVERLAY_ALPHA_DEFAULT = 0.6
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
