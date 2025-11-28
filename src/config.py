@@ -38,7 +38,7 @@ ORIG_TO_COMBINED = {
     1: 0,    # sidewalk -> Built env
     2: 0,    # construction -> Built env
     3: 5,    # tram-track -> Track area
-    4: 4,    # fence -> Sign
+    4: 0,    # fence -> Built env
     5: 4,    # pole -> Sign
     6: 4,    # traffic-light -> Sign
     7: 4,    # traffic-sign -> Sign
