@@ -42,11 +42,11 @@ def compute_iou(pred,
     Args:
         pred: Predicted class indices [B, H, W]
         target: Ground truth class indices [B, H, W]
-        num_classes: Number of combined classes (3)
+        num_classes: Number of combined classes (6)
         ignore_index: Index to ignore (255)
     
     Returns:
-        dict: IoU per class {0: iou_0, 1: iou_1, 2: iou_2}
+        dict: IoU per class {0: iou_0, 1: iou_1, ..., 5: iou_5}
     """
     ious = {}
 
@@ -115,12 +115,12 @@ def create_stratified_split(dataset,
         indices = list(range(len(dataset)))
         logger.info(f"Using full dataset: {len(dataset)} samples")
 
-    # Check which images have objects (class 2)
+    # Check which images have the 'Object' class (class 3)
     logger.info("Analyzing objects presence for stratification...")
     has_objects = []
     for i in tqdm(indices, desc='Checking object presence'):
         _, mask = dataset[i]
-        has_objects.append((mask == 2).any().item())
+        has_objects.append((mask == 3).any().item())
 
     object_count = sum(has_objects)
     logger.info(f"Images with objects: {object_count}/{len(indices)} ({object_count/len(indices):.1%})")
@@ -153,7 +153,7 @@ def train_one_epoch(model,
 
     running_loss = 0.0
     running_acc = 0.0
-    running_ious = {0: [], 1: [], 2: []}
+    running_ious = {i: [] for i in range(NUM_COMBINED_CLASSES)}
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}')
 
@@ -207,7 +207,7 @@ def validate(model,
 
     running_loss = 0.0
     running_acc = 0.0
-    running_ious = {0: [], 1: [], 2: []}
+    running_ious = {i: [] for i in range(NUM_COMBINED_CLASSES)}
 
     with torch.no_grad():
         for images, masks in tqdm(dataloader, desc='Validating'):
@@ -295,8 +295,8 @@ def main(resume_from_checkpoint_path=None):
 
     # Model
     logger.info("\n=== Initializing Model ===")
-    model = RailSegmentationModel(freeze_backbone=True)
-    model = model.to(device)
+    rail_seg_model = RailSegmentationModel(freeze_backbone=True)
+    rail_seg_model = rail_seg_model.to(device)
 
     # Loss functions with class weights
     class_weights = torch.tensor(CLASS_WEIGHTS).to(device)
@@ -305,7 +305,7 @@ def main(resume_from_checkpoint_path=None):
 
     # Optimizer
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        filter(lambda p: p.requires_grad, rail_seg_model.parameters()),
         lr=LEARNING_RATE
     )
     logger.info(f"Optimizer: Adam, LR = {LEARNING_RATE}")
@@ -324,7 +324,7 @@ def main(resume_from_checkpoint_path=None):
     if resume_from_checkpoint_path:
         logger.info(f"Resuming from checkpoint: {resume_from_checkpoint_path}")
         checkpoint = torch.load(resume_from_checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        rail_seg_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         logger.info(f"Resuming from epoch {start_epoch}")
@@ -334,12 +334,12 @@ def main(resume_from_checkpoint_path=None):
 
         # Train
         train_loss, train_acc, train_ious = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch
+            rail_seg_model, train_loader, criterion, optimizer, device, epoch
         )
 
         # Validate
         val_loss, val_acc, val_ious = validate(
-            model, val_loader, criterion, device
+            rail_seg_model, val_loader, criterion, device
         )
 
         epoch_time = time.time() - epoch_start
@@ -356,9 +356,12 @@ def main(resume_from_checkpoint_path=None):
         logger.info(f"Train Acc:  {train_acc:.4f} | Val Acc:  {val_acc:.4f}")
         logger.info(f"Train mIoU: {train_mean_iou:.4f} | Val mIoU: {val_mean_iou:.4f}")
         logger.info("\nPer-Class IoU:")
-        logger.info(f"  Track area (0):   Train={train_ious[0]:.4f} | Val={val_ious[0]:.4f}")
-        logger.info(f"  Scene context (1): Train={train_ious[1]:.4f} | Val={val_ious[1]:.4f}")
-        logger.info(f"  Object (2):        Train={train_ious[2]:.4f} | Val={val_ious[2]:.4f}")
+        logger.info(f"  Built env (0):   Train={train_ious[0]:.4f} | Val={val_ious[0]:.4f}")
+        logger.info(f"  Sky (1): Train={train_ious[1]:.4f} | Val={val_ious[1]:.4f}")
+        logger.info(f"  Vegetation (2): Train={train_ious[2]:.4f} | Val={val_ious[2]:.4f}")
+        logger.info(f"  Object (3): Train={train_ious[3]:.4f} | Val={val_ious[3]:.4f}")
+        logger.info(f"  Sign (4): Train={train_ious[4]:.4f} | Val={val_ious[4]:.4f}")
+        logger.info(f"  Track rail (5): Train={train_ious[5]:.4f} | Val={val_ious[5]:.4f}")
 
         # Save history
         training_history.append({
@@ -378,7 +381,7 @@ def main(resume_from_checkpoint_path=None):
             best_mean_iou = val_mean_iou
             best_val_loss = val_loss
             save_checkpoint(
-                model, optimizer, epoch, val_loss, val_ious,
+                rail_seg_model, optimizer, epoch, val_loss, val_ious,
                 os.path.join(CHECKPOINT_DIR, "best_model.pth")
             )
             logger.info(f"New best model! Val mIoU: {best_mean_iou:.4f}")
@@ -386,7 +389,7 @@ def main(resume_from_checkpoint_path=None):
         # Periodic checkpoint
         if (epoch + 1) % SAVE_INTERVAL == 0:
             save_checkpoint(
-                model, optimizer, epoch, val_loss, val_ious,
+                rail_seg_model, optimizer, epoch, val_loss, val_ious,
                 os.path.join(CHECKPOINT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
             )
     
@@ -401,7 +404,7 @@ def main(resume_from_checkpoint_path=None):
 
     # Save final model
     save_checkpoint(
-        model, optimizer, NUM_EPOCHS-1, val_loss, val_ious,
+        rail_seg_model, optimizer, NUM_EPOCHS-1, val_loss, val_ious,
         os.path.join(CHECKPOINT_DIR, "final_model.pth")
     )
 

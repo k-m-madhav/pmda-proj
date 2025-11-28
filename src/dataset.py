@@ -30,7 +30,7 @@ class RailSem19Dataset(Dataset):
     
     Responsibilities:
     1. Load RGB images from disk
-    2. Load preprocessed 3-class masks from disk
+    2. Load preprocessed 6-class masks from disk
     3. Apply DINOv2 image preprocessing (resize, normalize)
     4. Resize masks to 37x37 (patch grid)
     5. Return (image_tensor, mask_tensor) pairs
@@ -52,7 +52,9 @@ class RailSem19Dataset(Dataset):
         self.mask_size = mask_size
         
         # Load image processor with explicit size
-        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            model_name, use_fast=True
+        )
         logger.info(f"Loaded processor from {model_name}")
 
         # Get files
@@ -74,14 +76,15 @@ class RailSem19Dataset(Dataset):
 
         Returns:
             image: Tensor of shape (3, 518, 518) - preprocessed by DINOv2 processor; (color_channels, h, w)
-            mask: Tensor of shape (37, 37) with values in [0, 1, 2, 255]; 518 / 14 = 37, where 14 is patch_size
+            mask: Tensor of shape (37, 37) with values in [0, 1, 2, 3, 4, 5, 255]; 
+                  518 / 14 = 37, where 14 is patch_size
         """
 
         # Load image (1920x1080)
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         img = Image.open(img_path)
 
-        # Load preprocessed mask (only 3 classes)
+        # Load preprocessed mask (only 6 classes)
         mask_path = os.path.join(self.mask_dir, self.mask_files[idx])
         msk = np.array(Image.open(mask_path), dtype=np.int64)
 
@@ -91,12 +94,12 @@ class RailSem19Dataset(Dataset):
             return_tensors='pt',
             size={'height': self.input_size, 'width': self.input_size}
         )
-        image_tensor = inputs['pixel_values'].squeeze(0) # removes the batch size value; [3, 518, 518]
+        image_tensor = inputs['pixel_values'].squeeze(0) # removes the batch size value: [3, 518, 518]
 
         # Resize mask to match patch grid (37x37) since segmentation happens at patch-level (37×37),
         # not pixel-level (1920×1080), which is why the mask needs to match that resolution.
         # Image.Resampling.NEAREST preserves discrete labels i.e. values are still
-        # [0, 1, 2, 255] even after resizing the mask
+        # [0, 1, 2, 3, 4, 5, 255] even after resizing the mask
         mask_resized = Image.fromarray(msk.astype(np.uint8))
         mask_resized = mask_resized.resize((self.mask_size, self.mask_size), Image.Resampling.NEAREST)
         mask_tensor = torch.from_numpy(np.array(mask_resized, dtype=np.int64)).long()

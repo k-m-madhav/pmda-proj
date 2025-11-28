@@ -12,7 +12,7 @@ import argparse
 import torch
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.utils.data import DataLoader
@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from src.config import (
     SUBSET_SIZE, VAL_RATIO,
     RANDOM_SEED, NUM_COMBINED_CLASSES,
-    VOID_LABEL, DEVICE
+    VOID_LABEL, DEVICE, FINAL_CLASS_NAMES
 )
 from src.dataset import RailSem19Dataset
 from src.model import load_model
@@ -29,11 +29,11 @@ from src.utils import get_logger
 
 logger = get_logger("evaluate")
 
-CLASS_NAMES = {
-    0: "Track area",
-    1: "Scene context",
-    2: "Object"
-}
+# CLASS_NAMES = {
+#     0: "Track area",
+#     1: "Scene context",
+#     2: "Object"
+# }
 
 def compute_confusion_matrix(pred,
                               target,
@@ -137,9 +137,9 @@ def plot_confusion_matrix(cm,
         fmt = 'd'
         data = cm
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    _, ax = plt.subplots(figsize=(10, 8))
     sns.heatmap(
-        data, annot=True, fmt=fmt, cmap='blues',
+        data, annot=True, fmt=fmt, cmap='viridis',
         xticklabels=class_names, yticklabels=class_names,
         cbar_kws={'label': 'Normalized' if normalize else 'Count'},
         ax=ax
@@ -170,8 +170,7 @@ def evaluate_model(model,
 
     all_preds = []
     all_targets = []
-    running_ious = {0: [], 1: [], 2:[]}
-    running_loss = 0.0
+    running_ious = {i: [] for i in range(NUM_COMBINED_CLASSES)}
     running_acc = 0.0
 
     logger.info('Running evaluation...')
@@ -245,7 +244,7 @@ def print_evaluation_results(results,
     # Per-class IoU
     logger.info("\n Per-Class IoU:")
     for class_id, iou in results['class_ious'].items():
-        class_name = CLASS_NAMES[class_id]
+        class_name = FINAL_CLASS_NAMES[class_id]
         logger.info(f"  {class_name:20s} (class {class_id}): {iou:.4f} ({iou*100:.2f}%)")
 
     # Per-class detailed metrics
@@ -254,7 +253,7 @@ def print_evaluation_results(results,
     logger.info("-" * 70)
     
     for class_id, metrics in results['per_class_metrics'].items():
-        class_name = CLASS_NAMES[class_id]
+        class_name = FINAL_CLASS_NAMES[class_id]
         logger.info(
             f"{class_name:<20} "
             f"{metrics['precision']:>11.4f} "
@@ -270,13 +269,13 @@ def print_evaluation_results(results,
     # Header
     header = "True\\Pred    "
     for i in range(NUM_COMBINED_CLASSES):
-        header += f"{CLASS_NAMES[i][:12]:>14s}"
+        header += f"{FINAL_CLASS_NAMES[i][:12]:>14s}"
     logger.info(header)
     logger.info("-" * len(header))
 
     # Rows
     for i in range(NUM_COMBINED_CLASSES):
-        row = f"{CLASS_NAMES[i][:12]:<13}"
+        row = f"{FINAL_CLASS_NAMES[i][:12]:<13}"
         for j in range(NUM_COMBINED_CLASSES):
             row += f"{cm[i, j]:>14d}"
         logger.info(row)
@@ -286,11 +285,11 @@ def print_evaluation_results(results,
     
     # Best performing class
     best_class = max(results['class_ious'].items(), key=lambda x: x[1])
-    logger.info(f"  Best class: {CLASS_NAMES[best_class[0]]} (IoU: {best_class[1]:.2%})")
+    logger.info(f"  Best class: {FINAL_CLASS_NAMES[best_class[0]]} (IoU: {best_class[1]:.2%})")
     
     # Worst performing class
     worst_class = min(results['class_ious'].items(), key=lambda x: x[1])
-    logger.info(f"  Needs improvement: {CLASS_NAMES[worst_class[0]]} (IoU: {worst_class[1]:.2%})")
+    logger.info(f"  Needs improvement: {FINAL_CLASS_NAMES[worst_class[0]]} (IoU: {worst_class[1]:.2%})")
 
     # Main confusions
     cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
@@ -301,7 +300,7 @@ def print_evaluation_results(results,
         for j in range(NUM_COMBINED_CLASSES):
             if i != j and cm_norm[i, j] > 0.1:  # >10% confusion
                 logger.info(
-                    f"    {CLASS_NAMES[i]} -> {CLASS_NAMES[j]}: "
+                    f"    {FINAL_CLASS_NAMES[i]} -> {FINAL_CLASS_NAMES[j]}: "
                     f"{cm_norm[i, j]:.1%} ({cm[i, j]} pixels)"
                 )
     
@@ -315,7 +314,7 @@ def main():
                        help='Subset size used during training')
     parser.add_argument('--output_dir', type=str, default='evaluation_results',
                        help='Directory to save evaluation results')
-    parser.add_argument('--split', type=str, choices=['train', 'val', 'both'], default='val',
+    parser.add_argument('--split', type=str, choices=['train', 'val', 'both'], default='both',
                        help='Which split to evaluate')
     
     args = parser.parse_args()
@@ -364,15 +363,15 @@ def main():
         # Save confusion matrices
         plot_confusion_matrix(
             val_results['confusion_matrix'],
-            [CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
-            save_path=os.path.join(output_dir, 'confusion_matrix_val.png'),
+            [FINAL_CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
+            save_path=os.path.join(output_dir, 'upd_confusion_matrix_val.png'),
             normalize=False
         )
         
         plot_confusion_matrix(
             val_results['confusion_matrix'],
-            [CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
-            save_path=os.path.join(output_dir, 'confusion_matrix_val_normalized.png'),
+            [FINAL_CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
+            save_path=os.path.join(output_dir, 'upd_confusion_matrix_val_normalized.png'),
             normalize=True
         )
 
@@ -387,15 +386,15 @@ def main():
         # Save confusion matrices
         plot_confusion_matrix(
             train_results['confusion_matrix'],
-            [CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
-            save_path=os.path.join(output_dir, 'confusion_matrix_train.png'),
+            [FINAL_CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
+            save_path=os.path.join(output_dir, 'upd_confusion_matrix_train.png'),
             normalize=False
         )
         
         plot_confusion_matrix(
             train_results['confusion_matrix'],
-            [CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
-            save_path=os.path.join(output_dir, 'confusion_matrix_train_normalized.png'),
+            [FINAL_CLASS_NAMES[i] for i in range(NUM_COMBINED_CLASSES)],
+            save_path=os.path.join(output_dir, 'upd_confusion_matrix_train_normalized.png'),
             normalize=True
         )
     
@@ -419,7 +418,7 @@ def main():
             val_iou = val_results['class_ious'][class_id]
             diff = train_iou - val_iou
             logger.info(
-                f"  {CLASS_NAMES[class_id]:20s}: "
+                f"  {FINAL_CLASS_NAMES[class_id]:20s}: "
                 f"Train={train_iou:.4f}, Val={val_iou:.4f}, "
                 f"Diff={diff:+.4f}"
             )
