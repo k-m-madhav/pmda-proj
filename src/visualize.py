@@ -7,6 +7,7 @@ Visualization script for segmentation predictions.
 Displays original image, ground truth mask, and predicted mask side-by-side.
 """
 
+import random
 import os
 import argparse
 import torch
@@ -16,10 +17,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 from src.config import (
-    IMG_DIR, MASK_DIR,
-    PROCESSED_MASK_DIR,
-    NUM_COMBINED_CLASSES,
-    DEVICE,
+    DEVICE, FINAL_CLASS_NAMES,
+    CLASS_COLORS_NORMALIZED
 )
 from src.model import load_model
 from src.dataset import RailSem19Dataset
@@ -27,23 +26,8 @@ from src.utils import get_logger
 
 logger = get_logger("visualize")
 
-# Class colors and names
-CLASS_COLORS = {
-    0: np.array([255, 0, 0]) / 255.0,      # Track area - Red
-    1: np.array([0, 255, 0]) / 255.0,      # Scene context - Green
-    2: np.array([0, 0, 255]) / 255.0,      # Object - Blue
-    255: np.array([0, 0, 0]) / 255.0       # Void - Black
-}
-
-CLASS_NAMES = {
-    0: "Track area",
-    1: "Scene context",
-    2: "Object",
-    255: "Void (ignored)"
-}
-
 def create_colored_mask(mask,
-                         colors=CLASS_COLORS):
+                         colors=CLASS_COLORS_NORMALIZED):
     """
     Convert class mask to RGB visualization.
     
@@ -109,11 +93,14 @@ def visualize_prediction(image,
 
     # Add legend
     legend_elements = [
-        Patch(facecolor=CLASS_COLORS[0], label=CLASS_NAMES[0]),
-        Patch(facecolor=CLASS_COLORS[1], label=CLASS_NAMES[1]),
-        Patch(facecolor=CLASS_COLORS[2], label=CLASS_NAMES[2]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[0], label=FINAL_CLASS_NAMES[0]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[1], label=FINAL_CLASS_NAMES[1]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[2], label=FINAL_CLASS_NAMES[2]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[3], label=FINAL_CLASS_NAMES[3]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[4], label=FINAL_CLASS_NAMES[4]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[5], label=FINAL_CLASS_NAMES[5]),
     ]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=3, 
+    fig.legend(handles=legend_elements, loc='lower center', ncol=3,
                fontsize=12, frameon=True, fancybox=True)
     
     plt.tight_layout()
@@ -132,7 +119,7 @@ def visualize_prediction(image,
 
 def visualize_overlay(image,
                        pred_mask,
-                         alpha=0.5,
+                         alpha=0.4,
                            save_path=None,
                              show=True):
     """
@@ -168,9 +155,12 @@ def visualize_overlay(image,
     
     # Add legend
     legend_elements = [
-        Patch(facecolor=CLASS_COLORS[0], label=CLASS_NAMES[0]),
-        Patch(facecolor=CLASS_COLORS[1], label=CLASS_NAMES[1]),
-        Patch(facecolor=CLASS_COLORS[2], label=CLASS_NAMES[2]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[0], label=FINAL_CLASS_NAMES[0]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[1], label=FINAL_CLASS_NAMES[1]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[2], label=FINAL_CLASS_NAMES[2]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[3], label=FINAL_CLASS_NAMES[3]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[4], label=FINAL_CLASS_NAMES[4]),
+        Patch(facecolor=CLASS_COLORS_NORMALIZED[5], label=FINAL_CLASS_NAMES[5]),
     ]
     fig.legend(handles=legend_elements, loc='lower center', ncol=3,
                fontsize=12, frameon=True, fancybox=True)
@@ -261,8 +251,8 @@ def main():
     # Load model
     logger.info(f"Loading model from {args.checkpoint}...")
     device = torch.device(DEVICE)
-    model = load_model(args.checkpoint, device=device)
-    model.eval()
+    rail_seg_model = load_model(args.checkpoint, device=device)
+    rail_seg_model.eval()
     logger.info("Model loaded successfully!")
 
     # Load dataset
@@ -276,7 +266,6 @@ def main():
         logger.info(f"Visualizing specific indices: {indices}")
     else:
         # Random samples
-        import random
         random.seed(42)
         indices = random.sample(range(len(dataset)), min(args.num_samples, len(dataset)))
         logger.info(f"Visualizing {len(indices)} random samples")
@@ -287,7 +276,7 @@ def main():
 
         try:
             # Get prediction
-            image, gt_mask, pred_mask = predict_from_dataset(model, dataset, idx, device)
+            image, gt_mask, pred_mask = predict_from_dataset(rail_seg_model, dataset, idx, device)
 
             # Compute accuracy for this sample
             valid_mask = gt_mask != 255
@@ -300,13 +289,13 @@ def main():
             logger.info(f"  Unique pred classes: {np.unique(pred_mask)}")
 
             # Save side-by-side visualization
-            save_path = os.path.join(output_dir, f"sample_{idx:04d}_comparison.png")
-            visualize_prediction(image, gt_mask, pred_mask, 
+            save_path = os.path.join(output_dir, f"upd_sample_{idx:04d}_comparison.png")
+            visualize_prediction(image, gt_mask, pred_mask,
                                save_path=save_path, show=args.show)
 
             # Save overlay if requested
             if args.overlay:
-                overlay_path = os.path.join(output_dir, f"sample_{idx:04d}_overlay.png")
+                overlay_path = os.path.join(output_dir, f"upd_sample_{idx:04d}_overlay.png")
                 visualize_overlay(image, pred_mask, alpha=0.5,
                                 save_path=overlay_path, show=args.show)
         except Exception as e:

@@ -24,7 +24,7 @@ logger = get_logger("model")
 class SegmentationHead(nn.Module):
     """
     Lightweight segmentation head for DINOv2 features.
-    Maps 768-dim features to 3-class predictions per patch.
+    Maps 768-dim features to 6-class predictions per patch.
     """
 
     def __init__(self,
@@ -48,24 +48,24 @@ class SegmentationHead(nn.Module):
             nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
         )
 
-        logger.info(f"Initialized SegmentationHead: {in_channels} → {hidden_dim} → {num_classes}")
+        logger.info(f"Initialized SegmentationHead: {in_channels} -> {hidden_dim} -> {num_classes}")
 
     def forward(self, x):
         """
         Args:
             x: [B, 768, 37, 37] - DINOv2 spatial features
         Returns:
-            [B, 3, 37, 37] - Class logits per patch
+            [B, 6, 37, 37] - Class logits per patch
         """
         return self.head(x)
-   
+  
 class RailSegmentationModel(nn.Module):
     """
     Complete segmentation model: DINOv2 backbone + Segmentation head.
     
     Architecture:
     1. DINOv2 extracts features (frozen)
-    2. Remove CLS token and reshape to spatial grid
+    2. Remove CLS (Classifier) token and reshape to spatial grid
     3. Segmentation head predicts classes
     """
     def __init__(self,
@@ -183,8 +183,8 @@ if __name__ == "__main__":
     rail_model.eval()
     
     # Create dummy input
-    dummy_batch_size = 2
-    dummy_input = torch.randn(dummy_batch_size, 3, 518, 518)
+    DUMMY_BATCH_SIZE = 2
+    dummy_input = torch.randn(DUMMY_BATCH_SIZE, 3, 518, 518)
     logger.info(f"Input shape: {dummy_input.shape}")
     
     # Forward pass
@@ -193,16 +193,16 @@ if __name__ == "__main__":
         output = rail_model(dummy_input)
     
     logger.info(f"Output shape: {output.shape}")
-    logger.info(f"Expected: [{dummy_batch_size}, {NUM_COMBINED_CLASSES}, {PATCH_GRID_SIZE}, {PATCH_GRID_SIZE}]")
+    logger.info(f"Expected: [{DUMMY_BATCH_SIZE}, {NUM_COMBINED_CLASSES}, {PATCH_GRID_SIZE}, {PATCH_GRID_SIZE}]")
 
     # Verify shapes
-    assert output.shape == (dummy_batch_size, NUM_COMBINED_CLASSES, PATCH_GRID_SIZE, PATCH_GRID_SIZE), \
+    assert output.shape == (DUMMY_BATCH_SIZE, NUM_COMBINED_CLASSES, PATCH_GRID_SIZE, PATCH_GRID_SIZE), \
         f"Shape mismatch! Got {output.shape}"
 
     # Check value ranges
     logger.info(f"Output value range: [{output.min():.3f}, {output.max():.3f}]")
 
-    # Test with actual sample from dataset
+    # --- Test with actual sample from dataset ---
     logger.info("\n=== Testing with Real Data ===")
     from src.dataset import RailSem19Dataset
 

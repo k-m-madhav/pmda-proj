@@ -19,11 +19,14 @@ ORIGINAL_CLASS_NAMES = [
     "rail-track", "car", "truck", "trackbed", "on-rails", "rail-raised", "rail-embedded"
 ]
 
-# Final three categories (index: class name)
+# Final 6 categories (index: class name)
 FINAL_CLASS_NAMES = {
-    0: "Track area",
-    1: "Scene context",
-    2: "Object",
+    0: "Built env",
+    1: "Sky",
+    2: "Vegetation",
+    3: "Object",
+    4: "Sign",
+    5: "Track Rail",
     255: "Void"
 }
 
@@ -31,33 +34,36 @@ VOID_LABEL = 255  # Mask "ignore" value
 
 # Map from original idx to combined category idx
 ORIG_TO_COMBINED = {
-    0: 1,    # road -> Scene context
-    1: 1,    # sidewalk -> Scene context
-    2: 1,    # construction -> Scene context
-    3: 0,    # tram-track -> Track area
-    4: 1,    # fence -> Scene context
-    5: 1,    # pole -> Scene context
-    6: 1,    # traffic-light -> Scene context
-    7: 1,    # traffic-sign -> Scene context
-    8: 1,    # vegetation -> Scene context
-    9: 1,    # terrain -> Scene context
-    10: 1,   # sky -> Scene context
-    11: 2,   # human -> Object
-    12: 0,   # rail-track -> Track area
-    13: 2,   # car -> Object
-    14: 2,   # truck -> Object
-    15: 0,   # trackbed -> Track area
-    16: 0,   # on-rails -> Track area
-    17: 0,   # rail-raised -> Track area
-    18: 0,   # rail-embedded -> Track area
+    0: 0,    # road -> Built env
+    1: 0,    # sidewalk -> Built env
+    2: 0,    # construction -> Built env
+    3: 5,    # tram-track -> Track area
+    4: 4,    # fence -> Sign
+    5: 4,    # pole -> Sign
+    6: 4,    # traffic-light -> Sign
+    7: 4,    # traffic-sign -> Sign
+    8: 2,    # vegetation -> Vegetation
+    9: 0,    # terrain -> Built env
+    10: 1,   # sky -> Sky
+    11: 3,   # human -> Object
+    12: 5,   # rail-track -> Track Rail
+    13: 3,   # car -> Object
+    14: 3,   # truck -> Object
+    15: 5,   # trackbed -> Track Rail
+    16: 5,   # on-rails -> Track Rail
+    17: 5,   # rail-raised -> Track Rail
+    18: 5,   # rail-embedded -> Track Rail
     # Others (e.g. 255) can map to VOID_LABEL or be ignored
 }
 
 # RGB format (0-255) for Streamlit HTML/CSS
 CLASS_COLORS_RGB = {
-    0: [255, 0, 0], # Track area - Red
-    1: [0, 255, 0], # Scene context - Green
-    2: [0, 0, 255], # Object - Blue
+    0: [102, 51, 0], # Built env - Brown
+    1: [0, 0, 255], # Sky - Blue
+    2: [0, 255, 0], # Vegetation - Green
+    3: [127, 0, 255], # Object - Purple
+    4: [255, 255, 0], # Sign - Yellow
+    5: [255, 0, 0], # Track Rail - Red
     255: [0, 0, 0], # Void - Black
 }
 
@@ -87,7 +93,14 @@ BATCH_SIZE = 4         # Smaller for CPU
 LEARNING_RATE = 1e-3
 
 # Class imbalance (from 1000-sample analysis). Object class is getting a higher weight
-CLASS_WEIGHTS = [1.0, 1.0, 2.72]
+CLASS_WEIGHTS = [
+    1.0,    # Built env
+    1.0,    # Sky
+    1.0,    # Vegetation
+    5.0,    # Object (underrepresented)
+    2.0,    # Sign
+    1.0     # Track Rail
+]
 
 # Monitoring
 LOG_INTERVAL = 5       # Log every 10 batches

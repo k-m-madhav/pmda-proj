@@ -11,8 +11,7 @@ print("Loading DINOv2 model from Hugging Face...")
 # Load model and processor
 PRETRAINED_MODEL_NAME = "facebook/dinov2-base" # dinov3-vit7b16-pretrain-lvd1689m
 image_processor = AutoImageProcessor.from_pretrained(
-    PRETRAINED_MODEL_NAME, use_fast=True,
-    size={"height": 518, "width": 518}
+    PRETRAINED_MODEL_NAME, use_fast=True
 )
 model = AutoModel.from_pretrained(PRETRAINED_MODEL_NAME)
 
@@ -39,6 +38,7 @@ print(f"Original Image size: {width} x {height} pixels") # 1920 x 1080
 inputs = image_processor(
     images=rs19_sample_image,
     return_tensors="pt",
+    size={"height": 518, "width": 518}
 ).to(model.device)
 print(f"\nInput shape: {inputs['pixel_values'].shape}")
 # torch.Size([1, 3, 518, 518])
