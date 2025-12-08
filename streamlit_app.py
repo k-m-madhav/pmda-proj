@@ -8,12 +8,19 @@ from transformers import AutoImageProcessor
 # Ensure your local src folder structure exists
 from src.model import load_model
 from src.utils import preprocess_image, run_inference_and_upscale, postprocess_mask, create_overlay
+from src.hazard_clip import HazardCLIP
 from src.config import (
     PRETRAINED_MODEL_NAME, BEST_MODEL_PATH, DEVICE,
     NUM_COMBINED_CLASSES, CLASS_COLORS_RGB,
     CLASS_COLORS_NORMALIZED, CONFIDENCE_THRESHOLD_DEFAULT,
     OVERLAY_ALPHA_DEFAULT, VOID_LABEL, FINAL_CLASS_NAMES
 )
+
+# Class ids for quick access
+TRACK_CLASS_ID = 5
+VEGETATION_CLASS_ID = 2
+OBJECT_CLASS_ID = 3
+CLIP_HAZARD_THRESHOLD = 0.4
 
 # --- 1. Page Config & Custom CSS ---
 st.set_page_config(
@@ -61,8 +68,14 @@ def load_cached_model():
     model.eval()
     return model
 
+@st.cache_resource
+def load_clip_model():
+    """Load and cache CLIP-based hazard detector"""
+    return HazardCLIP(device=DEVICE)
+
 processor = load_processor()
 best_model = load_cached_model()
+hazard_clip = load_clip_model()
 
 # --- 4. UI Layout & Title ---
 st.title("Image Segmentation Demo")
@@ -151,13 +164,14 @@ def display_legend_badges(filtered_mask, class_colors, id_to_name):
     badges_html += '</div>'
     st.markdown(badges_html, unsafe_allow_html=True)
 
-def render_result_view(img, mask, scores, conf_thresh, alpha):
+def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None):
     """
     Helper to render the two-column view inside a placeholder.
     Note: For manual view, we generate overlay on the fly.
     """
     # Apply filtering
     filt_mask = postprocess_mask(mask, scores, conf_thresh)
+    track_present = np.any(filt_mask == TRACK_CLASS_ID)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -169,8 +183,74 @@ def render_result_view(img, mask, scores, conf_thresh, alpha):
         ov = create_overlay(img, filt_mask, alpha, CLASS_COLORS_NORMALIZED)
         st.image(ov, use_container_width=True)
     
+    # Alert if a hazard is present on/near the track
+    hazard, hazard_labels = detect_track_intrusion(filt_mask)
+    clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
+    if hazard or clip_vote:
+        messages = []
+        if hazard:
+            classes_text = ", ".join(hazard_labels)
+            messages.append(f"Segmentation: {classes_text} on/near the track")
+        if clip_vote:
+            messages.append(clip_text)
+        st.error("⚠️ Alert: " + " | ".join(messages))
+
     st.divider()
     display_legend_badges(filt_mask, CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
+
+def binary_dilation(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
+    """
+    Lightweight binary dilation to mark a small vicinity around the track.
+    Avoids extra dependencies while giving a buffer around the rails.
+    """
+    dilated = mask
+    for _ in range(iterations):
+        padded = np.pad(dilated, 1, mode="constant", constant_values=False)
+        neighborhoods = [
+            padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
+            padded[1:-1, :-2], padded[1:-1, 1:-1], padded[1:-1, 2:],
+            padded[2:, :-2], padded[2:, 1:-1], padded[2:, 2:]
+        ]
+        dilated = np.logical_or.reduce(neighborhoods)
+    return dilated
+
+def detect_track_intrusion(mask: np.ndarray):
+    """
+    Detect if vegetation or objects are on/near the track.
+    We expand the track mask slightly to catch close-by intrusions.
+    """
+    track_mask = mask == TRACK_CLASS_ID
+    if not np.any(track_mask):
+        return False, []
+
+    track_vicinity = binary_dilation(track_mask, iterations=3)
+    hazard_classes = []
+
+    for cls_id in (VEGETATION_CLASS_ID, OBJECT_CLASS_ID):
+        class_mask = mask == cls_id
+        overlap = track_vicinity & class_mask
+        if np.any(overlap):
+            hazard_classes.append(FINAL_CLASS_NAMES.get(cls_id, f"Class {cls_id}"))
+
+    return len(hazard_classes) > 0, hazard_classes
+
+def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP_HAZARD_THRESHOLD):
+    """
+    Determine if CLIP predicts a hazard with enough confidence to count as a vote.
+    """
+    if not clip_result or not track_present:
+        return False, ""
+
+    label = clip_result.get("label", "").lower()
+    confidence = clip_result.get("confidence", 0.0)
+
+    if label == "clear railway track":
+        return False, ""
+
+    if confidence < threshold:
+        return False, ""
+
+    return True, f"{clip_result['label']} ({confidence:.2f})"
 
 # --- 7. Main Logic ---
 
@@ -201,11 +281,15 @@ if uploaded_files:
                         image, image_tensor, best_model, DEVICE
                     )
 
+                    # CLIP-based hazard prediction (secondary vote)
+                    clip_result = hazard_clip.predict_image(image)
+
                     # Store results
                     st.session_state.batch_results[image_key] = {
                         "image": image,
                         "pred_mask": pred_mask_upscaled,
-                        "confidence_scores": confidence_scores
+                        "confidence_scores": confidence_scores,
+                        "clip_hazard": clip_result
                     }
                 except Exception as e:
                     st.error(f"Error processing {file.name}: {e}")
@@ -242,15 +326,23 @@ if uploaded_files:
                 mask = data["pred_mask"]
                 scores = data["confidence_scores"]
                 filt_mask = postprocess_mask(mask, scores, confidence_threshold)
+                hazard, hazard_labels = detect_track_intrusion(filt_mask)
+                track_present = np.any(filt_mask == TRACK_CLASS_ID)
                 
                 # Generate the overlay image here
                 final_overlay = create_overlay(img, filt_mask, overlay_alpha, CLASS_COLORS_NORMALIZED)
-                
+                clip_result = st.session_state.batch_results[fname].get("clip_hazard")
+                clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
+
                 slideshow_data.append({
                     "name": fname,
                     "original": img,
                     "overlay": final_overlay,
-                    "mask": filt_mask
+                    "mask": filt_mask,
+                    "hazard": hazard,
+                    "hazard_labels": hazard_labels,
+                    "clip_vote": clip_vote,
+                    "clip_text": clip_text
                 })
             progress_bar.progress((i + 1) / len(current_file_names))
         
@@ -264,11 +356,20 @@ if uploaded_files:
                 c1, c2 = st.columns(2)
                 with c1:
                     st.subheader("📷 Original")
-                    st.image(slide['original'], use_container_width=True)
+                    st.image(slide['original'])
                 with c2:
                     st.subheader("🎯 Segmentation")
-                    st.image(slide['overlay'], use_container_width=True)
+                    st.image(slide['overlay'])
                 
+                if slide["hazard"] or slide["clip_vote"]:
+                    messages = []
+                    if slide["hazard"]:
+                        classes_text = ", ".join(slide["hazard_labels"])
+                        messages.append(f"Segmentation: {classes_text} on/near the track")
+                    if slide["clip_vote"]:
+                        messages.append(slide["clip_text"])
+                    st.error("⚠️ Alert: " + " | ".join(messages))
+
                 st.divider()
                 display_legend_badges(slide['mask'], CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
             
@@ -290,7 +391,8 @@ if uploaded_files:
                     data["pred_mask"], 
                     data["confidence_scores"], 
                     confidence_threshold, 
-                    overlay_alpha
+                    overlay_alpha,
+                    data.get("clip_hazard")
                 )
 
 # Footer
