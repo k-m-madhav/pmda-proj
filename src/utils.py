@@ -69,7 +69,7 @@ def preprocess_image(image, processor, input_size=INPUT_SIZE, device=DEVICE):
 
     return image_tensor
 
-def run_inference_and_upscale(original_image, image_tensor, model, device):
+def run_inference_and_upscale(original_image, image_tensor, model, device, class_weights=None):
     """
     Run inference and return predictions + confidence scores
     
@@ -86,6 +86,11 @@ def run_inference_and_upscale(original_image, image_tensor, model, device):
     with torch.no_grad():
         image_batch = image_tensor.unsqueeze(0).to(device)
         outputs = model(image_batch)  # [1, num_classes, H, W]
+
+        # Optional class weighting to bias certain classes
+        if class_weights is not None:
+            weight_t = torch.tensor(class_weights, device=device).view(1, -1, 1, 1)
+            outputs = outputs * weight_t
         
         # Get probabilities
         probabilities = torch.softmax(outputs, dim=1)[0]  # [num_classes, H, W]
@@ -204,3 +209,69 @@ def create_overlay(original_image, pred_mask, alpha, class_colors=CLASS_COLORS_N
     overlay = np.clip(overlay, 0, 1)
 
     return overlay
+
+def check_track_suitability(scenario, brightness, contrast, edge_density):
+    """
+    Decide if visibility is suitable for rail operations.
+    Returns dict with status in {GO, CAUTION, STOP} and a human-readable reason.
+    """
+    scenario_l = (scenario or "").lower()
+    thresholds = {
+        "brightness": {"go": 60.0, "caution": 40.0},
+        "contrast": {"go": 25.0, "caution": 15.0},
+        "edge_density": {"go": 10.0, "caution": 6.0},
+    }
+
+    # Scenario-specific adjustments
+    if "night" in scenario_l:
+        thresholds["brightness"] = {"go": 50.0, "caution": 30.0}
+        thresholds["contrast"]["caution"] = 10.0
+        thresholds["edge_density"]["caution"] = 4.0
+    elif "fog" in scenario_l or "mist" in scenario_l:
+        thresholds["contrast"]["go"] = 35.0
+        thresholds["edge_density"]["go"] = 12.0
+    elif "rain" in scenario_l:
+        thresholds["contrast"]["go"] = 30.0
+        thresholds["edge_density"]["go"] = 12.0
+    elif "snow" in scenario_l:
+        thresholds["brightness"]["go"] = 70.0
+        thresholds["contrast"]["go"] = 30.0
+        thresholds["edge_density"]["go"] = 12.0
+
+    def to_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    vals = {
+        "brightness": to_float(brightness),
+        "contrast": to_float(contrast),
+        "edge_density": to_float(edge_density),
+    }
+
+    status = "GO"
+    reasons = []
+
+    for metric, val in vals.items():
+        go_thr = thresholds[metric]["go"]
+        caution_thr = thresholds[metric]["caution"]
+
+        if val is None:
+            if status != "STOP":
+                status = "CAUTION"
+            reasons.append(f"{metric} missing")
+            continue
+
+        if val < caution_thr:
+            status = "STOP"
+            reasons.append(f"{metric} too low ({val:.1f} < {caution_thr})")
+        elif val < go_thr:
+            if status != "STOP":
+                status = "CAUTION"
+            reasons.append(f"{metric} marginal ({val:.1f} < {go_thr})")
+
+    if not reasons and status == "GO":
+        reasons.append("Visibility sufficient for rail operations")
+
+    return {"status": status, "reason": "; ".join(reasons)}
