@@ -55,6 +55,10 @@ RAIL_CLASS_WEIGHTS_BIASED = [1.0, 1.0, 1.0, 6.0, 2.0, 3.0]
 # KPI thresholds
 HORIZON_GO = 0.8   # 80% visible track is healthy
 HORIZON_CAUTION = 0.5
+SNOW_BRIGHTNESS_THRESHOLD = 175
+SNOW_COLOR_RANGE = 35
+SNOW_CAUTION_COVERAGE = 0.12
+SNOW_HEAVY_COVERAGE = 0.35
 
 # --- 1. Page Config & Custom CSS ---
 st.set_page_config(
@@ -351,12 +355,49 @@ def compute_simple_metrics(pil_img: Image.Image):
     edge_density = float((edge > edge.mean()).mean() * 100.0)
     return brightness, contrast, edge_density
 
-def compute_horizon(track_mask: np.ndarray) -> float:
-    """How far the track extends vertically (0-1)."""
-    coords = np.where(track_mask)
-    if len(coords[0]) == 0:
+def compute_track_band(mask: np.ndarray) -> np.ndarray:
+    """Compute a center corridor band for track-related checks."""
+    h, w = mask.shape
+    track_mask = mask == TRACK_CLASS_ID
+    x_coords = np.where(track_mask)[1]
+    center_x = x_coords.mean() if len(x_coords) else w / 2
+    band_half_width = max(int(w * 0.06), 4)
+    x_grid = np.arange(w)
+    core_cols = np.abs(x_grid - center_x) <= band_half_width
+    if np.any(track_mask):
+        min_y = np.where(track_mask)[0].min()
+    else:
+        min_y = int(h * 0.35)
+    band_rows = np.arange(h) >= min_y
+    return np.tile(core_cols, (h, 1)) & band_rows[:, None]
+
+def compute_snow_coverage(image: Image.Image, track_band: np.ndarray) -> float:
+    """Estimate snow coverage ratio within the track corridor band."""
+    if track_band is None or not np.any(track_band):
         return 0.0
-    min_y = coords[0].min()
+    arr = np.array(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[0] != track_band.shape[0] or arr.shape[1] != track_band.shape[1]:
+        return 0.0
+    arr_f = arr.astype(np.float32)
+    r = arr_f[..., 0]
+    g = arr_f[..., 1]
+    b = arr_f[..., 2]
+    max_c = np.maximum.reduce([r, g, b])
+    min_c = np.minimum.reduce([r, g, b])
+    brightness = (r + g + b) / 3.0
+    snow_pixels = (brightness >= SNOW_BRIGHTNESS_THRESHOLD) & ((max_c - min_c) <= SNOW_COLOR_RANGE)
+    return float(snow_pixels[track_band].mean())
+
+def compute_horizon(track_mask: np.ndarray) -> float:
+    """How far the track extends vertically (0-1), ignoring tiny speckles."""
+    if track_mask is None or track_mask.size == 0:
+        return 0.0
+    row_counts = track_mask.sum(axis=1)
+    min_row_pixels = max(2, int(track_mask.shape[1] * 0.0015))
+    valid_rows = np.where(row_counts >= min_row_pixels)[0]
+    if valid_rows.size == 0:
+        return 0.0
+    min_y = valid_rows.min()
     h = track_mask.shape[0]
     return max(0.0, min(1.0, (h - min_y) / h))
 
@@ -396,6 +437,21 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
     # Re-enable CLIP hazard vote with strict filtering
     clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
 
+    track_band = compute_track_band(mask)
+    snow_coverage = compute_snow_coverage(image, track_band)
+    snow_level = None
+    if snow_coverage >= SNOW_HEAVY_COVERAGE:
+        snow_level = "heavy"
+    elif snow_coverage >= SNOW_CAUTION_COVERAGE:
+        snow_level = "light"
+
+    if clip_text and "snow" in clip_text.lower() and snow_level != "heavy":
+        clip_vote = False
+        clip_text = ""
+    if snow_level == "heavy":
+        clip_vote = True
+        clip_text = f"heavy snow blocking the track ({snow_coverage*100:.0f}%)"
+
     scenario_str = None
     if weather_row:
         suitability = check_track_suitability(
@@ -416,10 +472,11 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
         scenario_str = None
 
     # Optional: ignore CLIP hazard vote on snowy scenes (weather classifier)
-    if scenario_str and "snow" in scenario_str:
+    if scenario_str and "snow" in scenario_str and snow_level != "heavy":
         clip_vote, clip_text = False, ""
 
-    horizon = compute_horizon(track_mask)
+    # Use raw predicted track mask to avoid under-reporting visibility.
+    horizon = compute_horizon(mask == TRACK_CLASS_ID)
     risks = compute_active_risks(hazard_mask, track_mask)
     rail_conf = compute_rail_confidence(filt_mask, scores, conf_thresh)
 
@@ -437,7 +494,14 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
     reason = suitability["reason"]
     if major_blocker or hazard or clip_vote:
         status = "STOP"
-        reason = "Track blocked/hazard detected; requires clearance"
+        if snow_level == "heavy":
+            reason = "Heavy snow blocking the track; clearance required"
+        else:
+            reason = "Track blocked/hazard detected; requires clearance"
+    elif snow_level == "light" and status != "STOP":
+        if status == "GO":
+            status = "CAUTION"
+        reason = "Proceed with caution (light snow on track)"
     elif status == "CAUTION":
         reason = "Drive with caution (visibility marginal)"
 
@@ -453,7 +517,8 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
         "horizon": horizon,
         "risks": risks,
         "rail_conf": rail_conf,
-        "major_blocker": major_blocker
+        "major_blocker": major_blocker,
+        "snow_coverage": snow_coverage
     }
 
 def display_kpi_row(analysis, current_availability=None):
@@ -713,7 +778,7 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
 
     hazard_like = {
         "obstruction on track", "object on track", "train collision", "person on track",
-        "vehicle on track", "snow blocking the track", "blocked track",
+        "vehicle on track", "snow blocking the track", "heavy snow blocking the track", "blocked track",
         "fallen tree", "tree on track", "fallen tree blocking track", "tree blocking track",
         "tree obstruction", "tree across track"
     }

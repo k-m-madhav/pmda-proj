@@ -16,6 +16,8 @@ class HazardCLIP:
             "fallen tree across the railway track",
             "railway track obstruction",
             "object blocking railway track",
+            "light snow on track",
+            "heavy snow blocking the track",
             "snow blocking the track",
             "train ahead on the track",
             "vegetation covering the railway track",
