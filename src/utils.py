@@ -223,10 +223,12 @@ def check_track_suitability(scenario, brightness, contrast, edge_density):
     }
 
     # Scenario-specific adjustments
-    if "night" in scenario_l:
-        thresholds["brightness"] = {"go": 50.0, "caution": 30.0}
-        thresholds["contrast"]["caution"] = 10.0
-        thresholds["edge_density"]["caution"] = 4.0
+    if "night" in scenario_l or "evening" in scenario_l or "dusk" in scenario_l:
+        # Trains have lights - relax thresholds significantly
+        # Focus is on track detection, not ambient brightness
+        thresholds["brightness"] = {"go": 10.0, "caution": 3.0}  # Very relaxed for night
+        thresholds["contrast"] = {"go": 3.0, "caution": 1.5}  # Very relaxed
+        thresholds["edge_density"] = {"go": 1.5, "caution": 0.8}  # Very relaxed - trains have lights
     elif "fog" in scenario_l or "mist" in scenario_l:
         thresholds["contrast"]["go"] = 35.0
         thresholds["edge_density"]["go"] = 12.0

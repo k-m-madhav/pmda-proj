@@ -38,16 +38,18 @@ import csv
 TRACK_CLASS_ID = 5
 VEGETATION_CLASS_ID = 2
 OBJECT_CLASS_ID = 3
-CLIP_HAZARD_THRESHOLD = 0.6   # Slightly lower to catch obvious hazards like fallen trees
-TRACK_VICINITY_DILATION = 2   # Expand a bit to catch occlusions
-MIN_INTRUSION_RATIO = 0.03    # Require >=3% of track vicinity overlap
-MIN_INTRUSION_PIXELS = 1200   # Minimum overlap area
-MIN_ONTRACK_PIXELS = 160      # Evidence directly on track
+CLIP_HAZARD_THRESHOLD = 0.65  # Higher threshold to reduce false positives
+TRACK_VICINITY_DILATION = 1   # Minimal dilation - focus on actual track
+MIN_INTRUSION_RATIO = 0.08    # Require >=8% of track core overlap (more strict)
+MIN_INTRUSION_PIXELS = 2500   # Higher minimum overlap area
+MIN_ONTRACK_PIXELS = 400      # Evidence directly on track (increased)
+MIN_ONTRACK_PIXELS_OBJECT = 150  # Smaller objects (person/vehicle) on track
 MIN_BLOB_PIXELS = 250         # Ignore tiny specks
-MIN_MAJOR_OVERLAP_PIXELS = 400    # Core overlap pixels to force STOP
-MIN_MAJOR_OVERLAP_RATIO = 0.03    # Core overlap ratio to force STOP
+MIN_MAJOR_OVERLAP_PIXELS = 800    # Core overlap pixels to force STOP (doubled)
+MIN_MAJOR_OVERLAP_RATIO = 0.10    # Core overlap ratio to force STOP (10% - tripled)
 MIN_VICINITY_OVERLAP_PIXELS = 1200  # Vicinity overlap pixels to force STOP
 MIN_VICINITY_OVERLAP_RATIO = 0.05   # Vicinity overlap ratio to force STOP
+TRACK_CORRIDOR_TOP_FRAC = 0.35
 
 # Bias rail model toward track/object for cleaner detection
 RAIL_CLASS_WEIGHTS_BIASED = [1.0, 1.0, 1.0, 6.0, 2.0, 3.0]
@@ -401,16 +403,16 @@ def compute_horizon(track_mask: np.ndarray) -> float:
     h = track_mask.shape[0]
     return max(0.0, min(1.0, (h - min_y) / h))
 
-def compute_active_risks(filt_mask: np.ndarray, track_mask: np.ndarray) -> int:
+def compute_active_risks(filt_mask: np.ndarray, track_band: np.ndarray) -> int:
     """Count object blobs near/over track."""
-    if not np.any(track_mask):
+    if track_band is None or not np.any(track_band):
         h, w = filt_mask.shape
         x_grid = np.arange(w)
         center_x = w / 2
         band_half_width = max(int(w * 0.06), 4)
         core_cols = np.abs(x_grid - center_x) <= band_half_width
-        track_mask = np.tile(core_cols, (h, 1))
-    vicinity = binary_dilation(track_mask, iterations=max(TRACK_VICINITY_DILATION, 1))
+        track_band = np.tile(core_cols, (h, 1))
+    vicinity = binary_dilation(track_band, iterations=max(TRACK_VICINITY_DILATION, 1))
     risk_mask = (filt_mask == OBJECT_CLASS_ID) & vicinity
     labels, num = cc_label(risk_mask, return_num=True, connectivity=1)
     count = 0
@@ -432,7 +434,7 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
     hazard_mask = postprocess_mask(mask, scores, relaxed_thresh)
 
     track_present = np.any(hazard_mask == TRACK_CLASS_ID)
-    track_mask, track_core, _ = build_track_core(hazard_mask)
+    track_mask, track_core, track_corridor, _ = build_track_core(hazard_mask)
     hazard, hazard_labels = detect_track_intrusion(hazard_mask, scores, conf_thresh)
     # Re-enable CLIP hazard vote with strict filtering
     clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
@@ -477,7 +479,7 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
 
     # Use raw predicted track mask to avoid under-reporting visibility.
     horizon = compute_horizon(mask == TRACK_CLASS_ID)
-    risks = compute_active_risks(hazard_mask, track_mask)
+    risks = compute_active_risks(hazard_mask, track_corridor)
     rail_conf = compute_rail_confidence(filt_mask, scores, conf_thresh)
 
     # Major overlap override: if large vegetation/object on core track band, force STOP
@@ -502,8 +504,27 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
         if status == "GO":
             status = "CAUTION"
         reason = "Proceed with caution (light snow on track)"
+    # Override visibility-based STOP if track is clear with high rail confidence
+    elif status == "STOP" and not hazard and not major_blocker and rail_conf >= 0.85:
+        # Track is clear and rail detection is confident - override visibility STOP
+        is_night_scene = scenario_str and any(term in scenario_str.lower() for term in ["night", "evening", "dusk", "dim"])
+        if is_night_scene:
+            status = "GO"
+            reason = "Track clear with good detection confidence (train lights enable safe operation)"
+        else:
+            status = "CAUTION"
+            reason = "Drive with caution (low visibility but track clear)"
     elif status == "CAUTION":
-        reason = "Drive with caution (visibility marginal)"
+        # Upgrade CAUTION→GO for night/evening scenes if track is clear and rail confidence is good
+        if not hazard and not major_blocker and rail_conf >= 0.90:
+            is_night_scene = scenario_str and any(term in scenario_str.lower() for term in ["night", "evening", "dusk", "dim"])
+            if is_night_scene:
+                status = "GO"
+                reason = "Track clear with good detection confidence (train lights enable safe operation)"
+            else:
+                reason = "Drive with caution (visibility marginal)"
+        else:
+            reason = "Drive with caution (visibility marginal)"
 
     return {
         "filtered_mask": filt_mask,
@@ -618,18 +639,24 @@ def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, 
     # KPIs row
     display_kpi_row(analysis, current_availability=analysis.get("availability", None))
 
-    # Alerts
-    if analysis["hazard"] or analysis["clip_vote"]:
+    # Alerts and Status
+    status = analysis["status"]
+    reason = analysis["reason"]
+    snow_coverage = analysis.get("snow_coverage", 0)
+    
+    # Always show snow alert if heavy snow detected
+    if snow_coverage >= SNOW_HEAVY_COVERAGE:
+        st.error(f"⚠️ Alert: heavy snow blocking the track ({snow_coverage*100:.1f}%)")
+    elif analysis["hazard"] or analysis["clip_vote"]:
         messages = []
         if analysis["hazard"]:
             classes_text = ", ".join(analysis["hazard_labels"])
             messages.append(f"{classes_text} on/near the track")
-        if analysis["clip_vote"]:
+        if analysis["clip_vote"] and snow_coverage < SNOW_HEAVY_COVERAGE:
             messages.append(analysis["clip_text"])
-        st.error("⚠️ Alert: " + " | ".join(messages))
+        if messages:
+            st.error("⚠️ Alert: " + " | ".join(messages))
 
-    status = analysis["status"]
-    reason = analysis["reason"]
     if status == "GO":
         st.success(f"🟢 GO: {reason}")
     elif status == "CAUTION":
@@ -705,53 +732,58 @@ def binary_dilation(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
     return dilated
 
 def build_track_core(mask: np.ndarray):
-    """Return (track_mask, track_core, track_vicinity) with fallback if no track pixels are present."""
+    """Return (track_mask, track_core, track_corridor, track_vicinity) with fallback if no track pixels are present."""
     h, w = mask.shape
     track_mask = mask == TRACK_CLASS_ID
-    # Fallback: if no track predicted, assume center band is the track corridor
-    if not np.any(track_mask):
-        x_grid = np.arange(w)
-        center_x = w / 2
-        band_half_width = max(int(w * 0.06), 4)
-        core_cols = np.abs(x_grid - center_x) <= band_half_width
-        track_core = np.tile(core_cols, (h, 1))
-        track_vicinity = binary_dilation(track_core, iterations=max(TRACK_VICINITY_DILATION, 1))
-        return track_mask, track_core, track_vicinity
+    band_half_width = max(int(w * 0.04), 3)  # Tighter ~8% band (was 6%) for more precise core
 
-    track_vicinity = binary_dilation(track_mask, iterations=TRACK_VICINITY_DILATION)
-    x_coords = np.where(track_mask)[1]
-    center_x = x_coords.mean() if len(x_coords) else w / 2
-    band_half_width = max(int(w * 0.06), 4)  # ~12% band or at least 4px
+    if np.any(track_mask):
+        x_coords = np.where(track_mask)[1]
+        center_x = x_coords.mean() if len(x_coords) else w / 2
+        min_y = np.where(track_mask)[0].min()
+        band_start = min(min_y, int(h * TRACK_CORRIDOR_TOP_FRAC))
+    else:
+        center_x = w / 2
+        band_start = int(h * TRACK_CORRIDOR_TOP_FRAC)
+
     x_grid = np.arange(w)
     core_cols = np.abs(x_grid - center_x) <= band_half_width
+    band_rows = np.arange(h) >= band_start
+    track_corridor = np.tile(core_cols, (h, 1)) & band_rows[:, None]
+
+    # Fallback: if no track predicted, assume center band is the track corridor
+    if not np.any(track_mask):
+        track_core = track_corridor
+        track_vicinity = binary_dilation(track_core, iterations=max(TRACK_VICINITY_DILATION, 1))
+        return track_mask, track_core, track_corridor, track_vicinity
+
+    track_vicinity = binary_dilation(track_mask, iterations=TRACK_VICINITY_DILATION)
     track_core = track_mask & core_cols
-    return track_mask, track_core, track_vicinity
+    return track_mask, track_core, track_corridor, track_vicinity
 
 def detect_track_intrusion(mask: np.ndarray, confidence_scores: np.ndarray, conf_threshold: float):
     """
-    Detect if vegetation or objects are on/near the track.
-    We expand the track mask slightly to catch close-by intrusions.
+    Detect if vegetation or objects are actually ON the track core (not just nearby).
     """
-    track_mask, track_core, track_vicinity = build_track_core(mask)
+    _, track_core, track_corridor, _ = build_track_core(mask)
 
     hazard_classes = []
-    vicinity_pixels = track_vicinity.sum()
     relaxed_thresh = max(conf_threshold * 0.5, 0.2)
     conf_mask = confidence_scores >= relaxed_thresh
 
     for cls_id in (VEGETATION_CLASS_ID, OBJECT_CLASS_ID):
         class_mask = mask == cls_id
-        overlap_vicinity = track_vicinity & class_mask & conf_mask
+        # Only check core track overlap - not corridor (corridor is too permissive)
         overlap_track = track_core & class_mask & conf_mask
-        if overlap_track.sum() < MIN_BLOB_PIXELS and overlap_vicinity.sum() < MIN_BLOB_PIXELS:
-            continue
-        overlap_pixels = overlap_vicinity.sum()
-        overlap_ratio = (overlap_pixels / vicinity_pixels) if vicinity_pixels else 0.0
-        overlap_on_track = overlap_track.sum()
-        if (
-            overlap_on_track >= MIN_ONTRACK_PIXELS
-            or (overlap_pixels >= MIN_INTRUSION_PIXELS and overlap_ratio >= MIN_INTRUSION_RATIO)
-        ):
+        overlap_track_pixels = overlap_track.sum()
+        
+        # Calculate ratio of track core that's blocked
+        core_area = track_core.sum()
+        core_ratio = overlap_track_pixels / core_area if core_area > 0 else 0.0
+        
+        min_ontrack = MIN_ONTRACK_PIXELS_OBJECT if cls_id == OBJECT_CLASS_ID else MIN_ONTRACK_PIXELS
+        # Require BOTH pixel count AND ratio thresholds (stricter)
+        if overlap_track_pixels >= min_ontrack and core_ratio >= MIN_INTRUSION_RATIO:
             hazard_classes.append(FINAL_CLASS_NAMES.get(cls_id, f"Class {cls_id}"))
 
     return len(hazard_classes) > 0, hazard_classes
@@ -759,6 +791,7 @@ def detect_track_intrusion(mask: np.ndarray, confidence_scores: np.ndarray, conf
 def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP_HAZARD_THRESHOLD):
     """
     Determine if CLIP predicts a hazard with enough confidence to count as a vote.
+    Only flag actual BLOCKING hazards, not vegetation near the track.
     """
     if not clip_result or not track_present:
         return False, ""
@@ -766,21 +799,23 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
     label = clip_result.get("label", "").lower()
     confidence = clip_result.get("confidence", 0.0)
 
+    # Clear track scenarios are NOT hazards
     harmless_phrases = {
-        "clear railway track",
-        "clear track",
-        "empty track",
-        "no obstruction",
-        "no obstacle"
+        "clear railway track", "clear track", "empty track",
+        "no obstruction", "no obstacle", "vegetation on the sides",
+        "clear railway track with vegetation"
     }
-    if label in harmless_phrases:
+    if any(phrase in label for phrase in harmless_phrases):
         return False, ""
 
+    # Must explicitly mention BLOCKING, not just presence
     hazard_like = {
-        "obstruction on track", "object on track", "train collision", "person on track",
-        "vehicle on track", "snow blocking the track", "heavy snow blocking the track", "blocked track",
-        "fallen tree", "tree on track", "fallen tree blocking track", "tree blocking track",
-        "tree obstruction", "tree across track"
+        "blocking", "blocked", "obstruction", "completely blocked",
+        "fallen across", "tree trunk blocking", "debris blocking",
+        "object directly blocking", "water covering rails",
+        "landslide debris", "heavy snow completely covering",
+        "train directly ahead", "overgrown blocking",
+        "people standing on", "vehicle stopped on"
     }
     hazard_match = any(h in label for h in hazard_like)
 
