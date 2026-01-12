@@ -229,7 +229,18 @@ st.title("Image / Video Segmentation Demo")
 st.markdown("Upload images or a local video (QuickTime .mov supported) to see segmentation results or run a slideshow.")
 
 # --- 5. Sidebar Controls ---
+# Select Mode
 with st.sidebar:
+    st.title("🛠️Dashboard")
+    
+    st.header("📊 Processing Mode")
+    app_mode = st.segmented_control(
+        "Select Analysis Target", 
+        options=["Image", "Video"], 
+        default="Image",
+        label_visibility="collapsed")
+    st.divider() # 加入分割線
+
     st.header("⚙️ Controls")
     st.info("Segmentation Model: Rail (DINOv2)", icon="🚈")
     # Check if we have processed results
@@ -282,15 +293,6 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("Local Video Input (optional)")
-    video_file = st.file_uploader(
-        "Upload a video",
-        type=["mp4", "mov", "mkv", "avi"],
-        accept_multiple_files=False,
-        help="QuickTime .mov and other common formats supported"
-    )
-    video_fps = st.slider("Sample FPS", min_value=0.5, max_value=5.0, value=1.0, step=0.5, help="Frames per second to sample")
-    video_process = st.button("Process Video", type="primary")
 
 # --- 6. Helper Functions ---
 def display_legend_badges(filtered_mask, class_colors, id_to_name):
@@ -629,7 +631,7 @@ def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, 
     
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📷 Original Image / Video")
+        st.subheader("📷 Original Image / Video")     
         st.image(img, use_container_width=True)
     with col2:
         st.subheader("🎯 Segmentation Overlay")
@@ -825,34 +827,54 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
     return True, f"{clip_result['label']} ({confidence:.2f})"
 
 # --- 7. Main Logic ---
+if app_mode == "Image":
+    st.subheader("🖼️ Image Mode")
+    uploaded_files = st.file_uploader(
+        "Choose images...",
+        type=["jpg", "jpeg", "png"],
+        help="Upload images for segmentation",
+        accept_multiple_files=True
+    )
+    video_file = None 
+    video_process = False
+else:
+    st.subheader("🎞️ Video Mode")
+    video_file = st.file_uploader(
+        "Choose video...", 
+        type=["mp4", "mov", "mkv", "avi"],
+        help="QuickTime .mov and other common formats supported"
+    )
+    # Sidebar  FPS Slider and Button
+    v_col1, v_col2 = st.columns([3, 1])
+    with v_col1:
+        video_fps = st.slider("Sample FPS", 0.5, 5.0, 1.0)
+    with v_col2:
+        st.write(" ")
+        video_process = st.button("Process Video", type="primary", use_container_width=True)
+    
+    #Ensure when switching to video, the image variable is empty
+    uploaded_files = None
 
-uploaded_files = st.file_uploader(
-    "Choose images...",
-    type=["jpg", "jpeg", "png"],
-    help="Upload images for segmentation",
-    accept_multiple_files=True
-)
+    if video_process:
+        if video_file:
+            suffix = Path(video_file.name).suffix or ".mp4"
+            tmp_dir = tempfile.mkdtemp()
+            local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
+            with open(local_video_path, "wb") as f:
+                f.write(video_file.read())
 
-if video_process:
-    if video_file:
-        suffix = Path(video_file.name).suffix or ".mp4"
-        tmp_dir = tempfile.mkdtemp()
-        local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
-        with open(local_video_path, "wb") as f:
-            f.write(video_file.read())
-
-        frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
-        if frames:
-            st.session_state.video_frames = [
-                {"name": f"video_frame_{i}.jpg", "image": frame}
-                for i, frame in enumerate(frames)
-            ]
-            st.success(f"Captured {len(frames)} frames from uploaded video.")
+            frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
+            if frames:
+                st.session_state.video_frames = [
+                    {"name": f"video_frame_{i}.jpg", "image": frame}
+                    for i, frame in enumerate(frames)
+                ]
+                st.success(f"Captured {len(frames)} frames from uploaded video.")
+            else:
+                st.session_state.video_frames = []
+                st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
         else:
-            st.session_state.video_frames = []
-            st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
-    else:
-        st.warning("Please upload a video file to process.")
+            st.warning("Please upload a video file to process.")
 
 # Combine uploaded files and video frames into a unified list
 input_items = []
@@ -899,18 +921,24 @@ if input_items:
                     st.error(f"Error processing {image_key}: {e}")
 
     # --- CONTROLS PHASE ---
-    # Selector for manual view
-    selected_file_name = st.sidebar.selectbox(
-        "📂 Select Image to View",
-        options=current_file_names,
-        index=0
-    )
-    
-    # Slideshow toggle button
-    start_slideshow = st.sidebar.button(
-        "▶️ Play Slideshow", 
-        disabled=len(current_file_names) < 2
-    )
+    ctrl_col1, ctrl_col2 = st.columns([3, 1])
+        
+    with ctrl_col1:
+            selected_file_name = st.selectbox(
+                "📂 Select Image to View",
+                options=current_file_names,
+                index=0
+            )
+        
+    with ctrl_col2:
+            st.write(" ") 
+            start_slideshow = st.button(
+                "▶️ Play Slideshow", 
+                disabled=len(current_file_names) < 2,
+                use_container_width=True
+            )
+        
+    st.divider()
 
     # --- DISPLAY PHASE ---
     main_display = st.empty()
