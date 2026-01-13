@@ -38,7 +38,7 @@ import csv
 TRACK_CLASS_ID = 5
 VEGETATION_CLASS_ID = 2
 OBJECT_CLASS_ID = 3
-CLIP_HAZARD_THRESHOLD = 0.65  # Higher threshold to reduce false positives
+CLIP_HAZARD_THRESHOLD = 0.75  # Increased from 0.65 to reduce false positives
 TRACK_VICINITY_DILATION = 1   # Minimal dilation - focus on actual track
 MIN_INTRUSION_RATIO = 0.08    # Require >=8% of track core overlap (more strict)
 MIN_INTRUSION_PIXELS = 2500   # Higher minimum overlap area
@@ -57,10 +57,10 @@ RAIL_CLASS_WEIGHTS_BIASED = [1.0, 1.0, 1.0, 6.0, 2.0, 3.0]
 # KPI thresholds
 HORIZON_GO = 0.8   # 80% visible track is healthy
 HORIZON_CAUTION = 0.5
-SNOW_BRIGHTNESS_THRESHOLD = 175
-SNOW_COLOR_RANGE = 35
-SNOW_CAUTION_COVERAGE = 0.12
-SNOW_HEAVY_COVERAGE = 0.35
+SNOW_BRIGHTNESS_THRESHOLD = 200  # Increased from 175 - much brighter to avoid white trains
+SNOW_COLOR_RANGE = 20  # Reduced from 35 - more uniform color required
+SNOW_CAUTION_COVERAGE = 0.25  # Increased from 0.12 - need more coverage to trigger
+SNOW_HEAVY_COVERAGE = 0.45  # Increased from 0.35
 
 # --- 1. Page Config & Custom CSS ---
 st.set_page_config(
@@ -229,7 +229,18 @@ st.title("Image / Video Segmentation Demo")
 st.markdown("Upload images or a local video (QuickTime .mov supported) to see segmentation results or run a slideshow.")
 
 # --- 5. Sidebar Controls ---
+# Select Mode
 with st.sidebar:
+    st.title("🛠️ Dashboard")
+    
+    st.header("📊 Processing Mode")
+    app_mode = st.segmented_control(
+        "Select Analysis Target", 
+        options=["Image", "Video"], 
+        default="Image",
+        label_visibility="collapsed"
+    )
+    
     st.header("⚙️ Controls")
     st.info("Segmentation Model: Rail (DINOv2)", icon="🚈")
     # Check if we have processed results
@@ -260,6 +271,16 @@ with st.sidebar:
     if not has_results:
         st.info("Upload images to enable settings")
     
+    # Video-specific controls
+    if app_mode == "Video":
+        st.divider()
+        st.header("🎬 Video Settings")
+        video_fps = st.slider(
+            "Sample FPS",
+            0.5, 5.0, 1.0, step=0.5,
+            help="Frames per second to sample"
+        )
+    
     st.divider()
     
     # Slideshow specific controls
@@ -280,17 +301,6 @@ with st.sidebar:
         f"**Classes detectable:** {NUM_COMBINED_CLASSES}\n"
         f"**Device:** {DEVICE}"
     )
-
-    st.divider()
-    st.header("Local Video Input (optional)")
-    video_file = st.file_uploader(
-        "Upload a video",
-        type=["mp4", "mov", "mkv", "avi"],
-        accept_multiple_files=False,
-        help="QuickTime .mov and other common formats supported"
-    )
-    video_fps = st.slider("Sample FPS", min_value=0.5, max_value=5.0, value=1.0, step=0.5, help="Frames per second to sample")
-    video_process = st.button("Process Video", type="primary")
 
 # --- 6. Helper Functions ---
 def display_legend_badges(filtered_mask, class_colors, id_to_name):
@@ -387,8 +397,18 @@ def compute_snow_coverage(image: Image.Image, track_band: np.ndarray) -> float:
     max_c = np.maximum.reduce([r, g, b])
     min_c = np.minimum.reduce([r, g, b])
     brightness = (r + g + b) / 3.0
-    snow_pixels = (brightness >= SNOW_BRIGHTNESS_THRESHOLD) & ((max_c - min_c) <= SNOW_COLOR_RANGE)
-    return float(snow_pixels[track_band].mean())
+    
+    # Very strict snow detection: bright, uniform white pixels
+    # Also check that it's actually white (all channels high), not just bright
+    snow_pixels = (
+        (brightness >= SNOW_BRIGHTNESS_THRESHOLD) & 
+        ((max_c - min_c) <= SNOW_COLOR_RANGE) &
+        (r >= 180) & (g >= 180) & (b >= 180)  # Must be white, not just bright
+    )
+    coverage = float(snow_pixels[track_band].mean())
+    
+    # Only report if coverage is significant (avoid false positives from reflections)
+    return coverage if coverage >= 0.05 else 0.0
 
 def compute_horizon(track_mask: np.ndarray) -> float:
     """How far the track extends vertically (0-1), ignoring tiny speckles."""
@@ -427,7 +447,13 @@ def compute_rail_confidence(filt_mask: np.ndarray, scores: np.ndarray, conf_thre
         return 0.0
     return float(scores[rail_pixels].mean())
 
-def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
+def is_video_frame(filename):
+    """Detect if this is a video frame vs static image."""
+    if not filename:
+        return False
+    return "video_frame_" in str(filename).lower() or filename.startswith("video_frame")
+
+def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row, is_video=False):
     # Two thresholds: strict for display, relaxed for hazard detection
     filt_mask = postprocess_mask(mask, scores, conf_thresh)
     relaxed_thresh = max(conf_thresh * 0.5, 0.2)
@@ -436,8 +462,41 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row):
     track_present = np.any(hazard_mask == TRACK_CLASS_ID)
     track_mask, track_core, track_corridor, _ = build_track_core(hazard_mask)
     hazard, hazard_labels = detect_track_intrusion(hazard_mask, scores, conf_thresh)
-    # Re-enable CLIP hazard vote with strict filtering
-    clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
+    
+    # VIDEO-SPECIFIC: Apply stricter CLIP threshold for video frames
+    clip_threshold = 0.85 if is_video else CLIP_HAZARD_THRESHOLD
+    clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present, threshold=clip_threshold)
+    
+    # CRITICAL: Validate CLIP claims against actual segmentation evidence
+    if clip_vote and track_present:
+        clip_conf = clip_result.get("confidence", 0) if clip_result else 0
+        clip_label = clip_result.get("label", "").lower() if clip_result else ""
+        
+        # VIDEO: Even stricter validation for video frames (distant objects, perspective issues)
+        min_object_threshold = MIN_ONTRACK_PIXELS_OBJECT * 2 if is_video else MIN_ONTRACK_PIXELS_OBJECT
+        min_corridor_threshold = MIN_ONTRACK_PIXELS * 2 if is_video else MIN_ONTRACK_PIXELS
+        
+        # If CLIP claims object/hazard blocking track, verify with segmentation
+        if any(word in clip_label for word in ["object", "blocking", "vehicle", "car", "people", "tree", "debris"]):
+            # Check if there's actually object/vegetation on the track core
+            object_on_core = ((hazard_mask == OBJECT_CLASS_ID) | (hazard_mask == VEGETATION_CLASS_ID)) & track_core
+            object_pixels = object_on_core.sum()
+            
+            # Also check corridor for more lenient detection
+            object_on_corridor = ((hazard_mask == OBJECT_CLASS_ID) | (hazard_mask == VEGETATION_CLASS_ID)) & track_corridor
+            corridor_pixels = object_on_corridor.sum()
+            
+            # If no significant object presence detected by segmentation, CLIP is wrong
+            if object_pixels < min_object_threshold and corridor_pixels < min_corridor_threshold:
+                clip_vote = False
+                clip_text = ""
+        
+        # Additional check: if track is very visible and CLIP confidence not extremely high, be skeptical
+        track_pixels = (hazard_mask == TRACK_CLASS_ID).sum()
+        confidence_threshold = 0.95 if is_video else 0.90  # Higher bar for video
+        if track_pixels > 8000 and clip_conf < confidence_threshold:
+            clip_vote = False
+            clip_text = ""
 
     track_band = compute_track_band(mask)
     snow_coverage = compute_snow_coverage(image, track_band)
@@ -600,13 +659,15 @@ def compute_session_availability(current_file_names, conf_thresh):
         if not data:
             continue
         weather_row = weather_lookup.get(os.path.basename(fname))
+        is_vid = is_video_frame(fname)
         analysis = analyze_frame(
             data["image"],
             data["pred_mask"],
             data["confidence_scores"],
             conf_thresh,
             data.get("clip_hazard"),
-            weather_row
+            weather_row,
+            is_video=is_vid
         )
         total += 1
         if analysis["status"] == "GO":
@@ -615,13 +676,14 @@ def compute_session_availability(current_file_names, conf_thresh):
         return None
     return go / total
 
-def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, weather_row=None, availability=None):
+def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, weather_row=None, availability=None, filename=None):
     """
     Helper to render the two-column view inside a placeholder.
     Note: For manual view, we generate overlay on the fly.
     """
     # Apply filtering and compute analysis
-    analysis = analyze_frame(img, mask, scores, conf_thresh, clip_result, weather_row)
+    is_vid = is_video_frame(filename) if filename else False
+    analysis = analyze_frame(img, mask, scores, conf_thresh, clip_result, weather_row, is_video=is_vid)
     if availability is not None:
         analysis["availability"] = availability
     else:
@@ -826,33 +888,55 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
 
 # --- 7. Main Logic ---
 
-uploaded_files = st.file_uploader(
-    "Choose images...",
-    type=["jpg", "jpeg", "png"],
-    help="Upload images for segmentation",
-    accept_multiple_files=True
-)
+if app_mode == "Image":
+    st.subheader("🖼️ Image Mode")
+    st.markdown("Choose images...")
+    uploaded_files = st.file_uploader(
+        "Drag and drop files here",
+        type=["jpg", "jpeg", "png"],
+        help="Limit 200MB per file • JPG, JPEG, PNG",
+        accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
+    
+    # Ensure when switching to image, the video variable is empty
+    st.session_state.video_frames = []
 
-if video_process:
-    if video_file:
-        suffix = Path(video_file.name).suffix or ".mp4"
-        tmp_dir = tempfile.mkdtemp()
-        local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
-        with open(local_video_path, "wb") as f:
-            f.write(video_file.read())
+elif app_mode == "Video":
+    st.subheader("🎬 Video Mode")
+    st.markdown("Choose video...")
+    video_file = st.file_uploader(
+        "Drag and drop file here",
+        type=["mov", "mp4", "mkv", "avi", "mpeg4"],
+        help="Limit 200MB per file • MP4, MOV, MKV, AVI, MPEG4",
+        label_visibility="collapsed"
+    )
+    
+    video_process = st.button("🎬 Process Video", type="primary", use_container_width=True)
+    
+    # Ensure when switching to video, the image variable is empty
+    uploaded_files = None
+    
+    if video_process:
+        if video_file:
+            suffix = Path(video_file.name).suffix or ".mp4"
+            tmp_dir = tempfile.mkdtemp()
+            local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
+            with open(local_video_path, "wb") as f:
+                f.write(video_file.read())
 
-        frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
-        if frames:
-            st.session_state.video_frames = [
-                {"name": f"video_frame_{i}.jpg", "image": frame}
-                for i, frame in enumerate(frames)
-            ]
-            st.success(f"Captured {len(frames)} frames from uploaded video.")
+            frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
+            if frames:
+                st.session_state.video_frames = [
+                    {"name": f"video_frame_{i}.jpg", "image": frame}
+                    for i, frame in enumerate(frames)
+                ]
+                st.success(f"Captured {len(frames)} frames from uploaded video.")
+            else:
+                st.session_state.video_frames = []
+                st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
         else:
-            st.session_state.video_frames = []
-            st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
-    else:
-        st.warning("Please upload a video file to process.")
+            st.warning("Please upload a video file to process.")
 
 # Combine uploaded files and video frames into a unified list
 input_items = []
@@ -899,18 +983,23 @@ if input_items:
                     st.error(f"Error processing {image_key}: {e}")
 
     # --- CONTROLS PHASE ---
-    # Selector for manual view
-    selected_file_name = st.sidebar.selectbox(
-        "📂 Select Image to View",
-        options=current_file_names,
-        index=0
-    )
-    
-    # Slideshow toggle button
-    start_slideshow = st.sidebar.button(
-        "▶️ Play Slideshow", 
-        disabled=len(current_file_names) < 2
-    )
+    with st.sidebar:
+        st.divider()
+        st.header("🎮 Playback Controls")
+        
+        # Selector for manual view
+        selected_file_name = st.selectbox(
+            "📂 Select Image to View",
+            options=current_file_names,
+            index=0
+        )
+        
+        # Slideshow toggle button
+        start_slideshow = st.button(
+            "▶️ Play Slideshow", 
+            disabled=len(current_file_names) < 2,
+            use_container_width=True
+        )
 
     # --- DISPLAY PHASE ---
     main_display = st.empty()
@@ -1011,7 +1100,8 @@ if input_items:
                     overlay_alpha,
                     data.get("clip_hazard"),
                     weather_row,
-                    availability=availability
+                    availability=availability,
+                    filename=selected_file_name
                 )
 
 # Footer

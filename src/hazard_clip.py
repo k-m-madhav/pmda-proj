@@ -20,10 +20,11 @@ class HazardCLIP:
             "landslide debris blocking railway track",
             "light snow on the track",
             "heavy snow completely covering and blocking the track",
-            "train directly ahead blocking the track",
             "vegetation overgrown blocking the railway track",
             "car or vehicle stopped on railway track",
-            "people standing on railway track"
+            "people standing on railway track",
+            "2 trains on same track, Immediate break to STOP"
+
         ]
 
     def predict(self, image_path):
