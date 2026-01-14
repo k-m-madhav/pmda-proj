@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import tempfile
 import os
+import base64
 from pathlib import Path
 from PIL import Image, ImageDraw
 import numpy as np
@@ -62,12 +63,68 @@ SNOW_COLOR_RANGE = 20  # Reduced from 35 - more uniform color required
 SNOW_CAUTION_COVERAGE = 0.25  # Increased from 0.12 - need more coverage to trigger
 SNOW_HEAVY_COVERAGE = 0.45  # Increased from 0.35
 
-# --- 1. Page Config & Custom CSS ---
+# --- 1. Company Branding Configuration ---
+company_name = "United Railroad" 
+banner_color = "#0e1117"  # Deep blue-black, consistent with Streamlit dark theme
+text_color = "#FFFFFF"    # White text
+
+# Function to convert image to Base64
+def get_base64_of_bin_file(bin_file):
+    """
+    Read a binary file (e.g., PNG logo) and convert it to a Base64 string.
+    This allows embedding the image directly in HTML/CSS.
+    """
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+# --- 2. Page Config & Custom CSS ---
 st.set_page_config(
     page_title="Segmentation Demo",
     page_icon="🚈",
     layout="wide"
 )
+
+# --- 3. Navigation Bar with Logo ---
+def render_navigation_bar():
+    """
+    Render a custom navigation bar with company logo and name.
+    """
+    try:
+        # Check if logo.png exists in the project root
+        logo_path = "logo.png"
+        if os.path.exists(logo_path):
+            logo_base64 = get_base64_of_bin_file(logo_path)
+            logo_html = f'<img src="data:image/png;base64,{logo_base64}" style="height: 40px; margin-right: 15px; vertical-align: middle;">'
+        else:
+            # Fallback to emoji if logo file not found
+            logo_html = '<span style="font-size: 32px; margin-right: 10px; vertical-align: middle;">🚆</span>'
+    except Exception:
+        # Fallback to emoji on any error
+        logo_html = '<span style="font-size: 32px; margin-right: 10px; vertical-align: middle;">🚆</span>'
+    
+    st.markdown(
+        f"""
+        <div style="
+            background-color: {banner_color};
+            padding: 15px 30px;
+            border-radius: 0px;
+            margin: -80px -80px 20px -80px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+        ">
+            {logo_html}
+            <span style="
+                color: {text_color};
+                font-size: 24px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            ">{company_name}</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 def inject_custom_css():
     """
@@ -145,8 +202,9 @@ def inject_custom_css():
     """, unsafe_allow_html=True)
 
 inject_custom_css()
+render_navigation_bar()
 
-# --- 2. Session State Initialization ---
+# --- 4. Session State Initialization ---
 if 'batch_results' not in st.session_state:
     st.session_state.batch_results = {}
 if 'video_frames' not in st.session_state:
@@ -467,36 +525,37 @@ def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row, is
     clip_threshold = 0.85 if is_video else CLIP_HAZARD_THRESHOLD
     clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present, threshold=clip_threshold)
     
-    # CRITICAL: Validate CLIP claims against actual segmentation evidence
+    # Light validation: Trust CLIP for critical hazards, only filter obvious false positives
+    # CLIP is better at detecting vehicles and major objects that segmentation might miss
     if clip_vote and track_present:
         clip_conf = clip_result.get("confidence", 0) if clip_result else 0
         clip_label = clip_result.get("label", "").lower() if clip_result else ""
+        _, track_core, track_corridor, track_vicinity = build_track_core(hazard_mask)
         
-        # VIDEO: Even stricter validation for video frames (distant objects, perspective issues)
-        min_object_threshold = MIN_ONTRACK_PIXELS_OBJECT * 2 if is_video else MIN_ONTRACK_PIXELS_OBJECT
-        min_corridor_threshold = MIN_ONTRACK_PIXELS * 2 if is_video else MIN_ONTRACK_PIXELS
+        # Validate generic "object blocking" claims (could be train/tram, not a hazard)
+        # If CLIP doesn't specify WHAT the object is, require segmentation evidence
+        is_generic_object = (
+            "object" in clip_label and 
+            "blocking" in clip_label and
+            not any(specific in clip_label for specific in ["car", "vehicle", "person", "people", "debris", "tree"])
+        )
         
-        # If CLIP claims object/hazard blocking track, verify with segmentation
-        if any(word in clip_label for word in ["object", "blocking", "vehicle", "car", "people", "tree", "debris"]):
-            # Check if there's actually object/vegetation on the track core
-            object_on_core = ((hazard_mask == OBJECT_CLASS_ID) | (hazard_mask == VEGETATION_CLASS_ID)) & track_core
-            object_pixels = object_on_core.sum()
-            
-            # Also check corridor for more lenient detection
-            object_on_corridor = ((hazard_mask == OBJECT_CLASS_ID) | (hazard_mask == VEGETATION_CLASS_ID)) & track_corridor
-            corridor_pixels = object_on_corridor.sum()
-            
-            # If no significant object presence detected by segmentation, CLIP is wrong
-            if object_pixels < min_object_threshold and corridor_pixels < min_corridor_threshold:
+        if is_generic_object:
+            # Require actual object detection in segmentation to confirm it's a real hazard
+            obj_on_corridor = ((hazard_mask == OBJECT_CLASS_ID) & track_corridor).sum()
+            # If no significant object detected by segmentation, it's likely a train/tram (not a hazard)
+            min_threshold = MIN_ONTRACK_PIXELS_OBJECT * 2 if is_video else MIN_ONTRACK_PIXELS_OBJECT
+            if obj_on_corridor < min_threshold:
                 clip_vote = False
                 clip_text = ""
         
-        # Additional check: if track is very visible and CLIP confidence not extremely high, be skeptical
-        track_pixels = (hazard_mask == TRACK_CLASS_ID).sum()
-        confidence_threshold = 0.95 if is_video else 0.90  # Higher bar for video
-        if track_pixels > 8000 and clip_conf < confidence_threshold:
-            clip_vote = False
-            clip_text = ""
+        # Validate vegetation claims (prone to false positives)
+        elif "vegetation" in clip_label or "overgrown" in clip_label or "tree" in clip_label:
+            veg_on_corridor = ((hazard_mask == VEGETATION_CLASS_ID) & track_corridor).sum()
+            # Only invalidate if NO vegetation detected at all
+            if veg_on_corridor == 0:
+                clip_vote = False
+                clip_text = ""
 
     track_band = compute_track_band(mask)
     snow_coverage = compute_snow_coverage(image, track_band)
@@ -608,7 +667,8 @@ def display_kpi_row(analysis, current_availability=None):
     risks = analysis["risks"]
     rail_conf = analysis["rail_conf"]
     clip_flag = analysis["clip_vote"]
-    risk_total = risks + (1 if clip_flag else 0)
+    # Don't double-count: CLIP only adds if segmentation found nothing
+    risk_total = risks if risks > 0 else (1 if clip_flag else 0)
 
     def status_pill(text, tone):
         return f"<span class='pill {tone}'>{text}</span>"
@@ -868,6 +928,15 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
         "clear railway track with vegetation"
     }
     if any(phrase in label for phrase in harmless_phrases):
+        return False, ""
+
+    # Trains/trams on their own track are NOT hazards (normal operation)
+    train_tram_phrases = {
+        "train on track", "tram on track", "train approaching",
+        "train in distance", "tram approaching", "locomotive",
+        "passenger train", "freight train", "railway vehicle"
+    }
+    if any(phrase in label for phrase in train_tram_phrases):
         return False, ""
 
     # Must explicitly mention BLOCKING, not just presence
