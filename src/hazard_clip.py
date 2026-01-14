@@ -9,17 +9,22 @@ class HazardCLIP:
         self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-        # Hazard detection labels
+        # Hazard detection labels - focus on BLOCKING hazards, not proximity
         self.labels = [
-            "clear railway track",
-            "tree blocking the track",
-            "fallen tree across the railway track",
-            "railway track obstruction",
-            "object blocking railway track",
-            "snow blocking the track",
-            "train ahead on the track",
-            "vegetation covering the railway track",
-            "car/vehicle on track"
+            "clear railway track with vegetation on the sides",
+            "tree fallen across and blocking the railway track",
+            "large tree trunk blocking the railway track",
+            "railway track completely blocked by obstruction",
+            "object directly blocking railway track",
+            "flooded railway track with water covering rails",
+            "landslide debris blocking railway track",
+            "light snow on the track",
+            "heavy snow completely covering and blocking the track",
+            "vegetation overgrown blocking the railway track",
+            "car or vehicle stopped on railway track",
+            "people standing on railway track",
+            "2 trains on same track, Immediate break to STOP"
+
         ]
 
     def predict(self, image_path):

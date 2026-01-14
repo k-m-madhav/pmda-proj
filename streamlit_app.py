@@ -2,12 +2,20 @@ import streamlit as st
 import time
 import tempfile
 import os
+import base64
 from pathlib import Path
 from PIL import Image, ImageDraw
 import numpy as np
+# Street (DeepLab) import commented out; rail-only mode enabled
+# import torch
+# from torchvision.models.segmentation import (
+#     deeplabv3_resnet50,
+#     DeepLabV3_ResNet50_Weights
+# )
+import torch
+from skimage.measure import label as cc_label
 
 from transformers import AutoImageProcessor
-
 # Ensure your local src folder structure exists
 from src.model import load_model
 from src.utils import (
@@ -31,18 +39,92 @@ import csv
 TRACK_CLASS_ID = 5
 VEGETATION_CLASS_ID = 2
 OBJECT_CLASS_ID = 3
-CLIP_HAZARD_THRESHOLD = 0.4
-TRACK_VICINITY_DILATION = 0   # No expansion; stay on the rails to avoid side bleed
-MIN_INTRUSION_RATIO = 0.03    # Require >=3% of track vicinity overlap
-MIN_INTRUSION_PIXELS = 800    # Require a minimum absolute overlap area
-MIN_ONTRACK_PIXELS = 80       # Require more evidence directly on track
+CLIP_HAZARD_THRESHOLD = 0.75  # Increased from 0.65 to reduce false positives
+TRACK_VICINITY_DILATION = 1   # Minimal dilation - focus on actual track
+MIN_INTRUSION_RATIO = 0.08    # Require >=8% of track core overlap (more strict)
+MIN_INTRUSION_PIXELS = 2500   # Higher minimum overlap area
+MIN_ONTRACK_PIXELS = 400      # Evidence directly on track (increased)
+MIN_ONTRACK_PIXELS_OBJECT = 150  # Smaller objects (person/vehicle) on track
+MIN_BLOB_PIXELS = 250         # Ignore tiny specks
+MIN_MAJOR_OVERLAP_PIXELS = 800    # Core overlap pixels to force STOP (doubled)
+MIN_MAJOR_OVERLAP_RATIO = 0.10    # Core overlap ratio to force STOP (10% - tripled)
+MIN_VICINITY_OVERLAP_PIXELS = 1200  # Vicinity overlap pixels to force STOP
+MIN_VICINITY_OVERLAP_RATIO = 0.05   # Vicinity overlap ratio to force STOP
+TRACK_CORRIDOR_TOP_FRAC = 0.35
 
-# --- 1. Page Config & Custom CSS ---
+# Bias rail model toward track/object for cleaner detection
+RAIL_CLASS_WEIGHTS_BIASED = [1.0, 1.0, 1.0, 6.0, 2.0, 3.0]
+
+# KPI thresholds
+HORIZON_GO = 0.8   # 80% visible track is healthy
+HORIZON_CAUTION = 0.5
+SNOW_BRIGHTNESS_THRESHOLD = 200  # Increased from 175 - much brighter to avoid white trains
+SNOW_COLOR_RANGE = 20  # Reduced from 35 - more uniform color required
+SNOW_CAUTION_COVERAGE = 0.25  # Increased from 0.12 - need more coverage to trigger
+SNOW_HEAVY_COVERAGE = 0.45  # Increased from 0.35
+
+# --- 1. Company Branding Configuration ---
+company_name = "United Railroad" 
+banner_color = "#0e1117"  # Deep blue-black, consistent with Streamlit dark theme
+text_color = "#FFFFFF"    # White text
+
+# Function to convert image to Base64
+def get_base64_of_bin_file(bin_file):
+    """
+    Read a binary file (e.g., PNG logo) and convert it to a Base64 string.
+    This allows embedding the image directly in HTML/CSS.
+    """
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+# --- 2. Page Config & Custom CSS ---
 st.set_page_config(
     page_title="Segmentation Demo",
     page_icon="🚈",
     layout="wide"
 )
+
+# --- 3. Navigation Bar with Logo ---
+def render_navigation_bar():
+    """
+    Render a custom navigation bar with company logo and name.
+    """
+    try:
+        # Check if logo.png exists in the project root
+        logo_path = "logo.png"
+        if os.path.exists(logo_path):
+            logo_base64 = get_base64_of_bin_file(logo_path)
+            logo_html = f'<img src="data:image/png;base64,{logo_base64}" style="height: 40px; margin-right: 15px; vertical-align: middle;">'
+        else:
+            # Fallback to emoji if logo file not found
+            logo_html = '<span style="font-size: 32px; margin-right: 10px; vertical-align: middle;">🚆</span>'
+    except Exception:
+        # Fallback to emoji on any error
+        logo_html = '<span style="font-size: 32px; margin-right: 10px; vertical-align: middle;">🚆</span>'
+    
+    st.markdown(
+        f"""
+        <div style="
+            background-color: {banner_color};
+            padding: 15px 30px;
+            border-radius: 0px;
+            margin: -80px -80px 20px -80px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+        ">
+            {logo_html}
+            <span style="
+                color: {text_color};
+                font-size: 24px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            ">{company_name}</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 def inject_custom_css():
     """
@@ -61,16 +143,76 @@ def inject_custom_css():
                 0% { opacity: 0.5; }
                 100% { opacity: 1; }
             }
+
+            /* KPI cards */
+            .kpi-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 12px;
+                margin: 12px 0 6px 0;
+            }
+            .kpi-card {
+                background: #ffffff;
+                border-radius: 12px;
+                padding: 12px 14px;
+                box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+                border: 1px solid #e6e6e6;
+                position: relative;
+                overflow: hidden;
+            }
+            .kpi-card::before {
+                content: "";
+                position: absolute;
+                top: 0; left: 0;
+                width: 100%; height: 4px;
+                background: linear-gradient(90deg, #7bd389, #4ca1af);
+            }
+            .kpi-title {
+                font-size: 13px;
+                font-weight: 600;
+                color: #5b6570;
+                margin-bottom: 6px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            .kpi-value {
+                font-size: 26px;
+                font-weight: 700;
+                color: #1f2933;
+                margin-bottom: 2px;
+            }
+            .kpi-sub {
+                font-size: 12px;
+                color: #6b7280;
+            }
+            .pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 6px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .pill.green { background: #e8f5e9; color: #1f7a3d; }
+            .pill.amber { background: #fff7e6; color: #b37400; }
+            .pill.red { background: #ffe8e6; color: #b83227; }
         </style>
     """, unsafe_allow_html=True)
 
 inject_custom_css()
+render_navigation_bar()
 
-# --- 2. Session State Initialization ---
+# --- 4. Session State Initialization ---
 if 'batch_results' not in st.session_state:
     st.session_state.batch_results = {}
 if 'video_frames' not in st.session_state:
     st.session_state.video_frames = []
+if 'kpi_history' not in st.session_state:
+    st.session_state.kpi_history = []
+
+SEGMENTATION_MODE = "Rail (DINOv2)"
 
 # --- 3. Cache & Model Loading ---
 @st.cache_resource
@@ -141,13 +283,24 @@ def load_weather_lookup():
 weather_lookup = load_weather_lookup()
 
 # --- 4. UI Layout & Title ---
-st.title("Image Segmentation Demo")
+st.title("Image / Video Segmentation Demo")
 st.markdown("Upload images or a local video (QuickTime .mov supported) to see segmentation results or run a slideshow.")
 
 # --- 5. Sidebar Controls ---
+# Select Mode
 with st.sidebar:
+    st.title("🛠️ Dashboard")
+    
+    st.header("📊 Processing Mode")
+    app_mode = st.segmented_control(
+        "Select Analysis Target", 
+        options=["Image", "Video"], 
+        default="Image",
+        label_visibility="collapsed"
+    )
+    
     st.header("⚙️ Controls")
-
+    st.info("Segmentation Model: Rail (DINOv2)", icon="🚈")
     # Check if we have processed results
     has_results = len(st.session_state.batch_results) > 0
     
@@ -176,6 +329,16 @@ with st.sidebar:
     if not has_results:
         st.info("Upload images to enable settings")
     
+    # Video-specific controls
+    if app_mode == "Video":
+        st.divider()
+        st.header("🎬 Video Settings")
+        video_fps = st.slider(
+            "Sample FPS",
+            0.5, 5.0, 1.0, step=0.5,
+            help="Frames per second to sample"
+        )
+    
     st.divider()
     
     # Slideshow specific controls
@@ -196,17 +359,6 @@ with st.sidebar:
         f"**Classes detectable:** {NUM_COMBINED_CLASSES}\n"
         f"**Device:** {DEVICE}"
     )
-
-    st.divider()
-    st.header("Local Video Input (optional)")
-    video_file = st.file_uploader(
-        "Upload a video",
-        type=["mp4", "mov", "mkv", "avi"],
-        accept_multiple_files=False,
-        help="QuickTime .mov and other common formats supported"
-    )
-    video_fps = st.slider("Sample FPS", min_value=0.5, max_value=5.0, value=1.0, step=0.5, help="Frames per second to sample")
-    video_process = st.button("Process Video", type="primary")
 
 # --- 6. Helper Functions ---
 def display_legend_badges(filtered_mask, class_colors, id_to_name):
@@ -263,46 +415,164 @@ def draw_bounding_boxes(img_array: np.ndarray, boxes):
 
     return np.array(img)
 
-def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, weather_row=None):
-    """
-    Helper to render the two-column view inside a placeholder.
-    Note: For manual view, we generate overlay on the fly.
-    """
-    # Apply filtering
+# --- KPI helpers ---
+def compute_simple_metrics(pil_img: Image.Image):
+    arr = np.array(pil_img.convert("L"), dtype=np.float32)
+    brightness = float(arr.mean())
+    contrast = float(arr.std())
+    gy, gx = np.gradient(arr)
+    edge = np.hypot(gx, gy)
+    edge_density = float((edge > edge.mean()).mean() * 100.0)
+    return brightness, contrast, edge_density
+
+def compute_track_band(mask: np.ndarray) -> np.ndarray:
+    """Compute a center corridor band for track-related checks."""
+    h, w = mask.shape
+    track_mask = mask == TRACK_CLASS_ID
+    x_coords = np.where(track_mask)[1]
+    center_x = x_coords.mean() if len(x_coords) else w / 2
+    band_half_width = max(int(w * 0.06), 4)
+    x_grid = np.arange(w)
+    core_cols = np.abs(x_grid - center_x) <= band_half_width
+    if np.any(track_mask):
+        min_y = np.where(track_mask)[0].min()
+    else:
+        min_y = int(h * 0.35)
+    band_rows = np.arange(h) >= min_y
+    return np.tile(core_cols, (h, 1)) & band_rows[:, None]
+
+def compute_snow_coverage(image: Image.Image, track_band: np.ndarray) -> float:
+    """Estimate snow coverage ratio within the track corridor band."""
+    if track_band is None or not np.any(track_band):
+        return 0.0
+    arr = np.array(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[0] != track_band.shape[0] or arr.shape[1] != track_band.shape[1]:
+        return 0.0
+    arr_f = arr.astype(np.float32)
+    r = arr_f[..., 0]
+    g = arr_f[..., 1]
+    b = arr_f[..., 2]
+    max_c = np.maximum.reduce([r, g, b])
+    min_c = np.minimum.reduce([r, g, b])
+    brightness = (r + g + b) / 3.0
+    
+    # Very strict snow detection: bright, uniform white pixels
+    # Also check that it's actually white (all channels high), not just bright
+    snow_pixels = (
+        (brightness >= SNOW_BRIGHTNESS_THRESHOLD) & 
+        ((max_c - min_c) <= SNOW_COLOR_RANGE) &
+        (r >= 180) & (g >= 180) & (b >= 180)  # Must be white, not just bright
+    )
+    coverage = float(snow_pixels[track_band].mean())
+    
+    # Only report if coverage is significant (avoid false positives from reflections)
+    return coverage if coverage >= 0.05 else 0.0
+
+def compute_horizon(track_mask: np.ndarray) -> float:
+    """How far the track extends vertically (0-1), ignoring tiny speckles."""
+    if track_mask is None or track_mask.size == 0:
+        return 0.0
+    row_counts = track_mask.sum(axis=1)
+    min_row_pixels = max(2, int(track_mask.shape[1] * 0.0015))
+    valid_rows = np.where(row_counts >= min_row_pixels)[0]
+    if valid_rows.size == 0:
+        return 0.0
+    min_y = valid_rows.min()
+    h = track_mask.shape[0]
+    return max(0.0, min(1.0, (h - min_y) / h))
+
+def compute_active_risks(filt_mask: np.ndarray, track_band: np.ndarray) -> int:
+    """Count object blobs near/over track."""
+    if track_band is None or not np.any(track_band):
+        h, w = filt_mask.shape
+        x_grid = np.arange(w)
+        center_x = w / 2
+        band_half_width = max(int(w * 0.06), 4)
+        core_cols = np.abs(x_grid - center_x) <= band_half_width
+        track_band = np.tile(core_cols, (h, 1))
+    vicinity = binary_dilation(track_band, iterations=max(TRACK_VICINITY_DILATION, 1))
+    risk_mask = (filt_mask == OBJECT_CLASS_ID) & vicinity
+    labels, num = cc_label(risk_mask, return_num=True, connectivity=1)
+    count = 0
+    for i in range(1, num + 1):
+        if (labels == i).sum() >= MIN_BLOB_PIXELS:
+            count += 1
+    return count
+
+def compute_rail_confidence(filt_mask: np.ndarray, scores: np.ndarray, conf_thresh: float) -> float:
+    rail_pixels = (filt_mask == TRACK_CLASS_ID) & (scores >= conf_thresh)
+    if not np.any(rail_pixels):
+        return 0.0
+    return float(scores[rail_pixels].mean())
+
+def is_video_frame(filename):
+    """Detect if this is a video frame vs static image."""
+    if not filename:
+        return False
+    return "video_frame_" in str(filename).lower() or filename.startswith("video_frame")
+
+def analyze_frame(image, mask, scores, conf_thresh, clip_result, weather_row, is_video=False):
+    # Two thresholds: strict for display, relaxed for hazard detection
     filt_mask = postprocess_mask(mask, scores, conf_thresh)
-    track_present = np.any(filt_mask == TRACK_CLASS_ID)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("📷 Original Image")
-        st.image(img, use_container_width=True)
-    with col2:
-        st.subheader("🎯 Segmentation Overlay")
-        # Generate overlay (no boxes)
-        ov = create_overlay(img, filt_mask, alpha, CLASS_COLORS_NORMALIZED)
-        st.image(ov, use_container_width=True)
-    
-    # Alert if a hazard is present on/near the track
-    hazard, hazard_labels = detect_track_intrusion(filt_mask, scores, conf_thresh)
-    clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
-    if hazard or clip_vote:
-        messages = []
-        if hazard:
-            classes_text = ", ".join(hazard_labels)
-            messages.append(f"{classes_text} on/near the track")
-        if clip_vote:
-            messages.append(clip_text)
-        st.error("⚠️ Alert: " + " | ".join(messages))
+    relaxed_thresh = max(conf_thresh * 0.5, 0.2)
+    hazard_mask = postprocess_mask(mask, scores, relaxed_thresh)
 
-    def compute_simple_metrics(pil_img: Image.Image):
-        arr = np.array(pil_img.convert("L"), dtype=np.float32)
-        brightness = float(arr.mean())
-        contrast = float(arr.std())
-        gy, gx = np.gradient(arr)
-        edge = np.hypot(gx, gy)
-        edge_density = float((edge > edge.mean()).mean() * 100.0)
-        return brightness, contrast, edge_density
+    track_present = np.any(hazard_mask == TRACK_CLASS_ID)
+    track_mask, track_core, track_corridor, _ = build_track_core(hazard_mask)
+    hazard, hazard_labels = detect_track_intrusion(hazard_mask, scores, conf_thresh)
+    
+    # VIDEO-SPECIFIC: Apply stricter CLIP threshold for video frames
+    clip_threshold = 0.85 if is_video else CLIP_HAZARD_THRESHOLD
+    clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present, threshold=clip_threshold)
+    
+    # Light validation: Trust CLIP for critical hazards, only filter obvious false positives
+    # CLIP is better at detecting vehicles and major objects that segmentation might miss
+    if clip_vote and track_present:
+        clip_conf = clip_result.get("confidence", 0) if clip_result else 0
+        clip_label = clip_result.get("label", "").lower() if clip_result else ""
+        _, track_core, track_corridor, track_vicinity = build_track_core(hazard_mask)
+        
+        # Validate generic "object blocking" claims (could be train/tram, not a hazard)
+        # If CLIP doesn't specify WHAT the object is, require segmentation evidence
+        is_generic_object = (
+            "object" in clip_label and 
+            "blocking" in clip_label and
+            not any(specific in clip_label for specific in ["car", "vehicle", "person", "people", "debris", "tree"])
+        )
+        
+        if is_generic_object:
+            # Require actual object detection in segmentation to confirm it's a real hazard
+            obj_on_corridor = ((hazard_mask == OBJECT_CLASS_ID) & track_corridor).sum()
+            # If no significant object detected by segmentation, it's likely a train/tram (not a hazard)
+            min_threshold = MIN_ONTRACK_PIXELS_OBJECT * 2 if is_video else MIN_ONTRACK_PIXELS_OBJECT
+            if obj_on_corridor < min_threshold:
+                clip_vote = False
+                clip_text = ""
+        
+        # Validate vegetation claims (prone to false positives)
+        elif "vegetation" in clip_label or "overgrown" in clip_label or "tree" in clip_label:
+            veg_on_corridor = ((hazard_mask == VEGETATION_CLASS_ID) & track_corridor).sum()
+            # Only invalidate if NO vegetation detected at all
+            if veg_on_corridor == 0:
+                clip_vote = False
+                clip_text = ""
 
+    track_band = compute_track_band(mask)
+    snow_coverage = compute_snow_coverage(image, track_band)
+    snow_level = None
+    if snow_coverage >= SNOW_HEAVY_COVERAGE:
+        snow_level = "heavy"
+    elif snow_coverage >= SNOW_CAUTION_COVERAGE:
+        snow_level = "light"
+
+    if clip_text and "snow" in clip_text.lower() and snow_level != "heavy":
+        clip_vote = False
+        clip_text = ""
+    if snow_level == "heavy":
+        clip_vote = True
+        clip_text = f"heavy snow blocking the track ({snow_coverage*100:.0f}%)"
+
+    scenario_str = None
     if weather_row:
         suitability = check_track_suitability(
             weather_row.get("scenario"),
@@ -310,23 +580,204 @@ def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, 
             weather_row.get("contrast"),
             weather_row.get("edge_density")
         )
+        scenario_str = (weather_row.get("scenario") or "").lower()
     else:
-        b, c, e = compute_simple_metrics(img)
+        b, c, e = compute_simple_metrics(image)
         suitability = check_track_suitability(
             scenario=None,
             brightness=b,
             contrast=c,
             edge_density=e
         )
+        scenario_str = None
 
-    # If hazards are detected, force STOP regardless of visibility
+    # Optional: ignore CLIP hazard vote on snowy scenes (weather classifier)
+    if scenario_str and "snow" in scenario_str and snow_level != "heavy":
+        clip_vote, clip_text = False, ""
+
+    # Use raw predicted track mask to avoid under-reporting visibility.
+    horizon = compute_horizon(mask == TRACK_CLASS_ID)
+    risks = compute_active_risks(hazard_mask, track_corridor)
+    rail_conf = compute_rail_confidence(filt_mask, scores, conf_thresh)
+
+    # Major overlap override: if large vegetation/object on core track band, force STOP
+    core_area = track_core.sum()
+    major_blocker = False
+    if core_area > 0:
+        blocker_mask = ((hazard_mask == VEGETATION_CLASS_ID) | (hazard_mask == OBJECT_CLASS_ID)) & track_core
+        blocker_pixels = blocker_mask.sum()
+        blocker_ratio = blocker_pixels / core_area if core_area else 0.0
+        if blocker_pixels >= MIN_MAJOR_OVERLAP_PIXELS and blocker_ratio >= MIN_MAJOR_OVERLAP_RATIO:
+            major_blocker = True
+
     status = suitability["status"]
     reason = suitability["reason"]
-    if hazard or clip_vote:
+    if major_blocker or hazard or clip_vote:
         status = "STOP"
-        reason = "Track blocked/hazard detected; requires clearance"
+        if snow_level == "heavy":
+            reason = "Heavy snow blocking the track; clearance required"
+        else:
+            reason = "Track blocked/hazard detected; requires clearance"
+    elif snow_level == "light" and status != "STOP":
+        if status == "GO":
+            status = "CAUTION"
+        reason = "Proceed with caution (light snow on track)"
+    # Override visibility-based STOP if track is clear with high rail confidence
+    elif status == "STOP" and not hazard and not major_blocker and rail_conf >= 0.85:
+        # Track is clear and rail detection is confident - override visibility STOP
+        is_night_scene = scenario_str and any(term in scenario_str.lower() for term in ["night", "evening", "dusk", "dim"])
+        if is_night_scene:
+            status = "GO"
+            reason = "Track clear with good detection confidence (train lights enable safe operation)"
+        else:
+            status = "CAUTION"
+            reason = "Drive with caution (low visibility but track clear)"
     elif status == "CAUTION":
-        reason = "Drive with caution (visibility marginal)"
+        # Upgrade CAUTION→GO for night/evening scenes if track is clear and rail confidence is good
+        if not hazard and not major_blocker and rail_conf >= 0.90:
+            is_night_scene = scenario_str and any(term in scenario_str.lower() for term in ["night", "evening", "dusk", "dim"])
+            if is_night_scene:
+                status = "GO"
+                reason = "Track clear with good detection confidence (train lights enable safe operation)"
+            else:
+                reason = "Drive with caution (visibility marginal)"
+        else:
+            reason = "Drive with caution (visibility marginal)"
+
+    return {
+        "filtered_mask": filt_mask,
+        "hazard_mask": hazard_mask,
+        "hazard": hazard,
+        "hazard_labels": hazard_labels,
+        "clip_vote": clip_vote,
+        "clip_text": clip_text,
+        "status": status,
+        "reason": reason,
+        "horizon": horizon,
+        "risks": risks,
+        "rail_conf": rail_conf,
+        "major_blocker": major_blocker,
+        "snow_coverage": snow_coverage
+    }
+
+def display_kpi_row(analysis, current_availability=None):
+    """Display KPI row as simple cards."""
+    status = analysis["status"]
+    horizon = analysis["horizon"]
+    risks = analysis["risks"]
+    rail_conf = analysis["rail_conf"]
+    clip_flag = analysis["clip_vote"]
+    # Don't double-count: CLIP only adds if segmentation found nothing
+    risk_total = risks if risks > 0 else (1 if clip_flag else 0)
+
+    def status_pill(text, tone):
+        return f"<span class='pill {tone}'>{text}</span>"
+
+    def tone_for(value, go_thr, caution_thr=None):
+        if caution_thr is None:
+            return "green" if value else "red"
+        if value >= go_thr:
+            return "green"
+        if value >= caution_thr:
+            return "amber"
+        return "red"
+
+    status_tone = "green" if status == "GO" else ("amber" if status == "CAUTION" else "red")
+    horizon_tone = tone_for(horizon, HORIZON_GO, HORIZON_CAUTION)
+    risk_tone = "red" if risk_total > 0 else "green"
+    rail_tone = "green" if rail_conf >= 0.6 else ("amber" if rail_conf >= 0.4 else "red")
+    availability_tone = "green" if (current_availability is not None and current_availability >= 0.8) else ("amber" if current_availability else "red")
+
+    cards = [
+        {"title": "🚦 Operational Status", "value": status, "sub": analysis["reason"], "tone": status_tone},
+        {"title": "👁️ Visibility Horizon", "value": f"{horizon*100:.0f}%", "sub": "Clear view" if horizon >= HORIZON_GO else ("Low visibility" if horizon < HORIZON_CAUTION else "Marginal"), "tone": horizon_tone},
+        {"title": "⚠️ Active Hazards", "value": risk_total, "sub": f"{risks} on/near track" if risks else ("Environmental hazard" if clip_flag else "Track clear"), "tone": risk_tone},
+        {"title": "🛡️ Rail Confidence", "value": f"{rail_conf:.2f}", "sub": "Healthy" if rail_conf >= 0.6 else "Lower confidence", "tone": rail_tone},
+        {"title": "📈 Track Availability", "value": f"{current_availability*100:.1f}%" if current_availability is not None else "--", "sub": "Session GO rate" if current_availability is not None else "Awaiting data", "tone": availability_tone if current_availability is not None else "amber"},
+    ]
+
+    blocks = ["<div class='kpi-grid'>"]
+    for c in cards:
+        blocks.append(
+            "<div class='kpi-card'>"
+            f"<div class='kpi-title'>{c['title']}</div>"
+            f"<div class='kpi-value'>{c['value']}</div>"
+            f"<div class='kpi-sub'>{status_pill(c['sub'], c['tone'])}</div>"
+            "</div>"
+        )
+    blocks.append("</div>")
+    st.markdown("\n".join(blocks), unsafe_allow_html=True)
+
+def compute_session_availability(current_file_names, conf_thresh):
+    """Compute GO ratio across current items."""
+    if not current_file_names:
+        return None
+    go = 0
+    total = 0
+    for fname in current_file_names:
+        data = st.session_state.batch_results.get(fname)
+        if not data:
+            continue
+        weather_row = weather_lookup.get(os.path.basename(fname))
+        is_vid = is_video_frame(fname)
+        analysis = analyze_frame(
+            data["image"],
+            data["pred_mask"],
+            data["confidence_scores"],
+            conf_thresh,
+            data.get("clip_hazard"),
+            weather_row,
+            is_video=is_vid
+        )
+        total += 1
+        if analysis["status"] == "GO":
+            go += 1
+    if total == 0:
+        return None
+    return go / total
+
+def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, weather_row=None, availability=None, filename=None):
+    """
+    Helper to render the two-column view inside a placeholder.
+    Note: For manual view, we generate overlay on the fly.
+    """
+    # Apply filtering and compute analysis
+    is_vid = is_video_frame(filename) if filename else False
+    analysis = analyze_frame(img, mask, scores, conf_thresh, clip_result, weather_row, is_video=is_vid)
+    if availability is not None:
+        analysis["availability"] = availability
+    else:
+        analysis["availability"] = None
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📷 Original Image / Video")
+        st.image(img, use_container_width=True)
+    with col2:
+        st.subheader("🎯 Segmentation Overlay")
+        ov = create_overlay(img, analysis["filtered_mask"], alpha, CLASS_COLORS_NORMALIZED)
+        st.image(ov, use_container_width=True)
+    
+    # KPIs row
+    display_kpi_row(analysis, current_availability=analysis.get("availability", None))
+
+    # Alerts and Status
+    status = analysis["status"]
+    reason = analysis["reason"]
+    snow_coverage = analysis.get("snow_coverage", 0)
+    
+    # Always show snow alert if heavy snow detected
+    if snow_coverage >= SNOW_HEAVY_COVERAGE:
+        st.error(f"⚠️ Alert: heavy snow blocking the track ({snow_coverage*100:.1f}%)")
+    elif analysis["hazard"] or analysis["clip_vote"]:
+        messages = []
+        if analysis["hazard"]:
+            classes_text = ", ".join(analysis["hazard_labels"])
+            messages.append(f"{classes_text} on/near the track")
+        if analysis["clip_vote"] and snow_coverage < SNOW_HEAVY_COVERAGE:
+            messages.append(analysis["clip_text"])
+        if messages:
+            st.error("⚠️ Alert: " + " | ".join(messages))
 
     if status == "GO":
         st.success(f"🟢 GO: {reason}")
@@ -336,7 +787,7 @@ def render_result_view(img, mask, scores, conf_thresh, alpha, clip_result=None, 
         st.error(f"🔴 STOP: {reason}")
 
     st.divider()
-    display_legend_badges(filt_mask, CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
+    display_legend_badges(analysis["filtered_mask"], CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
 
 def sample_video_frames(video_path: str, target_fps: float = 1.0, max_frames: int = 30):
     """
@@ -402,40 +853,59 @@ def binary_dilation(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
         dilated = np.logical_or.reduce(neighborhoods)
     return dilated
 
-def detect_track_intrusion(mask: np.ndarray, confidence_scores: np.ndarray, conf_threshold: float):
-    """
-    Detect if vegetation or objects are on/near the track.
-    We expand the track mask slightly to catch close-by intrusions.
-    """
-    track_mask = mask == TRACK_CLASS_ID
-    if not np.any(track_mask):
-        return False, []
-
+def build_track_core(mask: np.ndarray):
+    """Return (track_mask, track_core, track_corridor, track_vicinity) with fallback if no track pixels are present."""
     h, w = mask.shape
-    track_vicinity = binary_dilation(track_mask, iterations=TRACK_VICINITY_DILATION)
-    # Build a narrow band around the track centerline to focus on true blockers
-    x_coords = np.where(track_mask)[1]
-    center_x = x_coords.mean() if len(x_coords) else w / 2
-    band_half_width = max(int(w * 0.06), 4)  # ~12% band or at least 4px
+    track_mask = mask == TRACK_CLASS_ID
+    band_half_width = max(int(w * 0.04), 3)  # Tighter ~8% band (was 6%) for more precise core
+
+    if np.any(track_mask):
+        x_coords = np.where(track_mask)[1]
+        center_x = x_coords.mean() if len(x_coords) else w / 2
+        min_y = np.where(track_mask)[0].min()
+        band_start = min(min_y, int(h * TRACK_CORRIDOR_TOP_FRAC))
+    else:
+        center_x = w / 2
+        band_start = int(h * TRACK_CORRIDOR_TOP_FRAC)
+
     x_grid = np.arange(w)
     core_cols = np.abs(x_grid - center_x) <= band_half_width
+    band_rows = np.arange(h) >= band_start
+    track_corridor = np.tile(core_cols, (h, 1)) & band_rows[:, None]
+
+    # Fallback: if no track predicted, assume center band is the track corridor
+    if not np.any(track_mask):
+        track_core = track_corridor
+        track_vicinity = binary_dilation(track_core, iterations=max(TRACK_VICINITY_DILATION, 1))
+        return track_mask, track_core, track_corridor, track_vicinity
+
+    track_vicinity = binary_dilation(track_mask, iterations=TRACK_VICINITY_DILATION)
     track_core = track_mask & core_cols
+    return track_mask, track_core, track_corridor, track_vicinity
+
+def detect_track_intrusion(mask: np.ndarray, confidence_scores: np.ndarray, conf_threshold: float):
+    """
+    Detect if vegetation or objects are actually ON the track core (not just nearby).
+    """
+    _, track_core, track_corridor, _ = build_track_core(mask)
 
     hazard_classes = []
-    vicinity_pixels = track_vicinity.sum()
-    conf_mask = confidence_scores >= conf_threshold
+    relaxed_thresh = max(conf_threshold * 0.5, 0.2)
+    conf_mask = confidence_scores >= relaxed_thresh
 
     for cls_id in (VEGETATION_CLASS_ID, OBJECT_CLASS_ID):
         class_mask = mask == cls_id
-        overlap_vicinity = track_vicinity & class_mask & conf_mask
+        # Only check core track overlap - not corridor (corridor is too permissive)
         overlap_track = track_core & class_mask & conf_mask
-        overlap_pixels = overlap_vicinity.sum()
-        overlap_ratio = (overlap_pixels / vicinity_pixels) if vicinity_pixels else 0.0
-        overlap_on_track = overlap_track.sum()
-        if (
-            overlap_on_track >= MIN_ONTRACK_PIXELS
-            or (overlap_pixels >= MIN_INTRUSION_PIXELS and overlap_ratio >= MIN_INTRUSION_RATIO)
-        ):
+        overlap_track_pixels = overlap_track.sum()
+        
+        # Calculate ratio of track core that's blocked
+        core_area = track_core.sum()
+        core_ratio = overlap_track_pixels / core_area if core_area > 0 else 0.0
+        
+        min_ontrack = MIN_ONTRACK_PIXELS_OBJECT if cls_id == OBJECT_CLASS_ID else MIN_ONTRACK_PIXELS
+        # Require BOTH pixel count AND ratio thresholds (stricter)
+        if overlap_track_pixels >= min_ontrack and core_ratio >= MIN_INTRUSION_RATIO:
             hazard_classes.append(FINAL_CLASS_NAMES.get(cls_id, f"Class {cls_id}"))
 
     return len(hazard_classes) > 0, hazard_classes
@@ -443,6 +913,7 @@ def detect_track_intrusion(mask: np.ndarray, confidence_scores: np.ndarray, conf
 def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP_HAZARD_THRESHOLD):
     """
     Determine if CLIP predicts a hazard with enough confidence to count as a vote.
+    Only flag actual BLOCKING hazards, not vegetation near the track.
     """
     if not clip_result or not track_present:
         return False, ""
@@ -450,43 +921,91 @@ def evaluate_clip_vote(clip_result, track_present: bool, threshold: float = CLIP
     label = clip_result.get("label", "").lower()
     confidence = clip_result.get("confidence", 0.0)
 
-    if label == "clear railway track":
+    # Clear track scenarios are NOT hazards
+    harmless_phrases = {
+        "clear railway track", "clear track", "empty track",
+        "no obstruction", "no obstacle", "vegetation on the sides",
+        "clear railway track with vegetation"
+    }
+    if any(phrase in label for phrase in harmless_phrases):
         return False, ""
 
-    if confidence < threshold:
+    # Trains/trams on their own track are NOT hazards (normal operation)
+    train_tram_phrases = {
+        "train on track", "tram on track", "train approaching",
+        "train in distance", "tram approaching", "locomotive",
+        "passenger train", "freight train", "railway vehicle"
+    }
+    if any(phrase in label for phrase in train_tram_phrases):
+        return False, ""
+
+    # Must explicitly mention BLOCKING, not just presence
+    hazard_like = {
+        "blocking", "blocked", "obstruction", "completely blocked",
+        "fallen across", "tree trunk blocking", "debris blocking",
+        "object directly blocking", "water covering rails",
+        "landslide debris", "heavy snow completely covering",
+        "train directly ahead", "overgrown blocking",
+        "people standing on", "vehicle stopped on"
+    }
+    hazard_match = any(h in label for h in hazard_like)
+
+    if confidence < threshold or not hazard_match:
         return False, ""
 
     return True, f"{clip_result['label']} ({confidence:.2f})"
 
 # --- 7. Main Logic ---
 
-uploaded_files = st.file_uploader(
-    "Choose images...",
-    type=["jpg", "jpeg", "png"],
-    help="Upload images for segmentation",
-    accept_multiple_files=True
-)
+if app_mode == "Image":
+    st.subheader("🖼️ Image Mode")
+    st.markdown("Choose images...")
+    uploaded_files = st.file_uploader(
+        "Drag and drop files here",
+        type=["jpg", "jpeg", "png"],
+        help="Limit 200MB per file • JPG, JPEG, PNG",
+        accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
+    
+    # Ensure when switching to image, the video variable is empty
+    st.session_state.video_frames = []
 
-if video_process:
-    if video_file:
-        suffix = Path(video_file.name).suffix or ".mp4"
-        tmp_dir = tempfile.mkdtemp()
-        local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
-        with open(local_video_path, "wb") as f:
-            f.write(video_file.read())
+elif app_mode == "Video":
+    st.subheader("🎬 Video Mode")
+    st.markdown("Choose video...")
+    video_file = st.file_uploader(
+        "Drag and drop file here",
+        type=["mov", "mp4", "mkv", "avi", "mpeg4"],
+        help="Limit 200MB per file • MP4, MOV, MKV, AVI, MPEG4",
+        label_visibility="collapsed"
+    )
+    
+    video_process = st.button("🎬 Process Video", type="primary", use_container_width=True)
+    
+    # Ensure when switching to video, the image variable is empty
+    uploaded_files = None
+    
+    if video_process:
+        if video_file:
+            suffix = Path(video_file.name).suffix or ".mp4"
+            tmp_dir = tempfile.mkdtemp()
+            local_video_path = Path(tmp_dir) / f"uploaded_video{suffix}"
+            with open(local_video_path, "wb") as f:
+                f.write(video_file.read())
 
-        frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
-        if frames:
-            st.session_state.video_frames = [
-                {"name": f"video_frame_{i}.jpg", "image": frame}
-                for i, frame in enumerate(frames)
-            ]
-            st.success(f"Captured {len(frames)} frames from uploaded video.")
+            frames = sample_video_frames(str(local_video_path), target_fps=video_fps, max_frames=30)
+            if frames:
+                st.session_state.video_frames = [
+                    {"name": f"video_frame_{i}.jpg", "image": frame}
+                    for i, frame in enumerate(frames)
+                ]
+                st.success(f"Captured {len(frames)} frames from uploaded video.")
+            else:
+                st.session_state.video_frames = []
+                st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
         else:
-            st.session_state.video_frames = []
-            st.error("Could not sample frames from the uploaded video. Please try a different file or FPS.")
-    else:
-        st.warning("Please upload a video file to process.")
+            st.warning("Please upload a video file to process.")
 
 # Combine uploaded files and video frames into a unified list
 input_items = []
@@ -513,10 +1032,10 @@ if input_items:
                         image = item["image"].convert("RGB")
                     image_key = item["name"]
                     
-                    # Inference
+                    # Rail inference
                     image_tensor = preprocess_image(image, processor)
                     pred_mask_upscaled, confidence_scores = run_inference_and_upscale(
-                        image, image_tensor, best_model, DEVICE
+                        image, image_tensor, best_model, DEVICE, class_weights=RAIL_CLASS_WEIGHTS_BIASED
                     )
 
                     # CLIP-based hazard prediction (secondary vote)
@@ -533,18 +1052,23 @@ if input_items:
                     st.error(f"Error processing {image_key}: {e}")
 
     # --- CONTROLS PHASE ---
-    # Selector for manual view
-    selected_file_name = st.sidebar.selectbox(
-        "📂 Select Image to View",
-        options=current_file_names,
-        index=0
-    )
-    
-    # Slideshow toggle button
-    start_slideshow = st.sidebar.button(
-        "▶️ Play Slideshow", 
-        disabled=len(current_file_names) < 2
-    )
+    with st.sidebar:
+        st.divider()
+        st.header("🎮 Playback Controls")
+        
+        # Selector for manual view
+        selected_file_name = st.selectbox(
+            "📂 Select Image to View",
+            options=current_file_names,
+            index=0
+        )
+        
+        # Slideshow toggle button
+        start_slideshow = st.button(
+            "▶️ Play Slideshow", 
+            disabled=len(current_file_names) < 2,
+            use_container_width=True
+        )
 
     # --- DISPLAY PHASE ---
     main_display = st.empty()
@@ -555,42 +1079,27 @@ if input_items:
         slideshow_data = []
         progress_bar = st.progress(0, text="⏳ Pre-rendering frames for smooth playback...")
         
+        availability = compute_session_availability(current_file_names, confidence_threshold)
+
         for i, fname in enumerate(current_file_names):
             if fname in st.session_state.batch_results:
                 data = st.session_state.batch_results[fname]
                 
-                # We calculate everything NOW so the loop is instant
+                # Pre-calculate analysis so the loop is instant
                 img = data["image"]
                 mask = data["pred_mask"]
                 scores = data["confidence_scores"]
-                filt_mask = postprocess_mask(mask, scores, confidence_threshold)
-                hazard, hazard_labels = detect_track_intrusion(filt_mask, scores, confidence_threshold)
-                track_present = np.any(filt_mask == TRACK_CLASS_ID)
-                
-                # Generate the overlay image here
-                final_overlay = create_overlay(img, filt_mask, overlay_alpha, CLASS_COLORS_NORMALIZED)
                 clip_result = st.session_state.batch_results[fname].get("clip_hazard")
-                clip_vote, clip_text = evaluate_clip_vote(clip_result, track_present)
                 weather_row = weather_lookup.get(os.path.basename(fname))
-                suitability = None
-                if weather_row:
-                    suitability = check_track_suitability(
-                        weather_row.get("scenario"),
-                        weather_row.get("brightness"),
-                        weather_row.get("contrast"),
-                        weather_row.get("edge_density")
-                    )
+                analysis = analyze_frame(img, mask, scores, confidence_threshold, clip_result, weather_row)
+                analysis["availability"] = availability
+                final_overlay = create_overlay(img, analysis["filtered_mask"], overlay_alpha, CLASS_COLORS_NORMALIZED)
 
                 slideshow_data.append({
                     "name": fname,
                     "original": img,
                     "overlay": final_overlay,
-                    "mask": filt_mask,
-                    "hazard": hazard,
-                    "hazard_labels": hazard_labels,
-                    "clip_vote": clip_vote,
-                    "clip_text": clip_text,
-                    "suitability": suitability
+                    "analysis": analysis
                 })
             progress_bar.progress((i + 1) / len(current_file_names))
         
@@ -608,23 +1117,25 @@ if input_items:
                 with c2:
                     st.subheader("🎯 Segmentation")
                     st.image(slide['overlay'])
-                
-                if slide["hazard"] or slide["clip_vote"]:
+
+                analysis = slide["analysis"]
+                display_kpi_row(analysis, current_availability=analysis.get("availability"))
+
+                if analysis["hazard"] or analysis["clip_vote"]:
                     messages = []
-                    if slide["hazard"]:
-                        classes_text = ", ".join(slide["hazard_labels"])
+                    if analysis["hazard"]:
+                        classes_text = ", ".join(analysis["hazard_labels"])
                         messages.append(f"{classes_text} on/near the track")
-                    if slide["clip_vote"]:
-                        messages.append(slide["clip_text"])
+                    if analysis["clip_vote"]:
+                        messages.append(analysis["clip_text"])
                     st.error("⚠️ Alert: " + " | ".join(messages))
 
-                suitability = slide.get("suitability")
                 # Enforce STOP if any hazard/clip vote is detected, regardless of visibility
-                if slide["hazard"] or slide["clip_vote"]:
+                if analysis["hazard"] or analysis["clip_vote"]:
                     st.error("🔴 STOP: Track blocked/hazard detected; requires clearance")
-                elif suitability:
-                    status = suitability["status"]
-                    reason = suitability["reason"]
+                else:
+                    status = analysis["status"]
+                    reason = analysis["reason"]
                     if status == "GO":
                         st.success(f"🟢 GO: {reason}")
                     elif status == "CAUTION":
@@ -633,7 +1144,7 @@ if input_items:
                         st.error(f"🔴 STOP: {reason}")
 
                 st.divider()
-                display_legend_badges(slide['mask'], CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
+                display_legend_badges(analysis['filtered_mask'], CLASS_COLORS_RGB, FINAL_CLASS_NAMES)
             
             # The pause duration (default 0.5s)
             time.sleep(slideshow_speed)
@@ -645,6 +1156,7 @@ if input_items:
     else:
         # --- MANUAL MODE ---
         if selected_file_name and selected_file_name in st.session_state.batch_results:
+            availability = compute_session_availability(current_file_names, confidence_threshold)
             with main_display.container():
                 data = st.session_state.batch_results[selected_file_name]
                 weather_row = weather_lookup.get(os.path.basename(selected_file_name))
@@ -656,7 +1168,9 @@ if input_items:
                     confidence_threshold, 
                     overlay_alpha,
                     data.get("clip_hazard"),
-                    weather_row
+                    weather_row,
+                    availability=availability,
+                    filename=selected_file_name
                 )
 
 # Footer
